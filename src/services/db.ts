@@ -259,6 +259,14 @@ export const db = {
     if (supabase) {
       const cleanUpdates = { ...updates };
       if (cleanUpdates.password === '') delete cleanUpdates.password;
+
+      // If no actual updates, just fetch and return the user
+      if (Object.keys(cleanUpdates).length === 0) {
+        const { data, error } = await supabase.from('users').select('*').eq('id', id).single();
+        if (error) throw error;
+        return data;
+      }
+
       const { data, error } = await supabase.from('users').update(cleanUpdates).eq('id', id).select().single();
       if (error) throw error;
       await logAction(actor.id, actor.name, actor.role, `Updated User: ${data.name}`, JSON.stringify(updates));
