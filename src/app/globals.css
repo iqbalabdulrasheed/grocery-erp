@@ -1,0 +1,165 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --background: #0b0f19;
+  --foreground: #f3f4f6;
+  --text-title: #ffffff;
+  --text-muted: #9ca3af;
+  --panel-bg: rgba(17, 24, 39, 0.55);
+  --card-bg: rgba(31, 41, 55, 0.4);
+  --card-hover-bg: rgba(31, 41, 55, 0.6);
+  --border-color: rgba(255, 255, 255, 0.05);
+  --border-hover-color: rgba(255, 255, 255, 0.1);
+  --input-bg: rgba(17, 24, 39, 0.6);
+  --input-border: rgba(255, 255, 255, 0.1);
+  --body-gradient: radial-gradient(circle at top right, #111827, #0b0f19);
+  --panel-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+  --table-header-bg: rgba(255, 255, 255, 0.05);
+  --table-hover-bg: rgba(255, 255, 255, 0.02);
+  --nav-hover-bg: rgba(255, 255, 255, 0.05);
+}
+
+[data-theme="light"] {
+  --background: #f8fafc;
+  --foreground: #334155;
+  --text-title: #0f172a;
+  --text-muted: #64748b;
+  --panel-bg: rgba(255, 255, 255, 0.85);
+  --card-bg: rgba(241, 245, 249, 0.7);
+  --card-hover-bg: rgba(241, 245, 249, 0.95);
+  --border-color: rgba(15, 23, 42, 0.08);
+  --border-hover-color: rgba(15, 23, 42, 0.15);
+  --input-bg: rgba(255, 255, 255, 0.9);
+  --input-border: rgba(15, 23, 42, 0.12);
+  --body-gradient: radial-gradient(circle at top right, #f1f5f9, #f8fafc);
+  --panel-shadow: 0 8px 32px 0 rgba(148, 163, 184, 0.12);
+  --table-header-bg: rgba(15, 23, 42, 0.04);
+  --table-hover-bg: rgba(15, 23, 42, 0.015);
+  --nav-hover-bg: rgba(15, 23, 42, 0.05);
+}
+
+body {
+  background: var(--body-gradient);
+  color: var(--foreground);
+  min-height: 100vh;
+  font-family: var(--font-inter), sans-serif;
+  overflow-x: hidden;
+  transition: background 0.3s ease, color 0.3s ease;
+}
+
+/* Theme Adaptive Components */
+.glass-panel {
+  background: var(--panel-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  box-shadow: var(--panel-shadow);
+  color: var(--foreground);
+  transition: background 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.glass-card {
+  background: var(--card-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--border-color);
+  color: var(--foreground);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.glass-card:hover {
+  background: var(--card-hover-bg);
+  border-color: var(--border-hover-color);
+  transform: translateY(-2px);
+}
+
+.glass-input {
+  background: var(--input-bg);
+  border: 1px solid var(--input-border);
+  color: var(--text-title);
+  transition: all 0.2s ease;
+}
+
+.glass-input:focus {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.25);
+}
+
+/* Table styling updates */
+tr:hover {
+  background-color: var(--table-hover-bg);
+}
+
+thead {
+  background-color: var(--table-header-bg);
+}
+
+/* Micro-animations */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Scrollbar Customization */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3b82f6;
+}
+
+/* Print Styles for Reports and Invoices */
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #000000 !important;
+  }
+  
+  .no-print {
+    display: none !important;
+  }
+  
+  .print-only {
+    display: block !important;
+  }
+  
+  .print-card {
+    background: none !important;
+    border: none !important;
+    box-shadow: none !important;
+    backdrop-filter: none !important;
+    color: #000000 !important;
+    width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  table {
+    border-collapse: collapse !important;
+    width: 100% !important;
+  }
+
+  th, td {
+    border: 1px solid #ddd !important;
+    padding: 8px !important;
+    color: #000000 !important;
+  }
+}
