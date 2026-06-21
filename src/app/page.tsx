@@ -3,7 +3,7 @@
 import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { auth } from "@/services/auth";
-import { db, User } from "@/services/db";
+import { db, User, logAction } from "@/services/db";
 import { Lock, User as UserIcon, Sparkles, AlertCircle } from "lucide-react";
 
 export default function LoginPage() {
@@ -45,7 +45,7 @@ export default function LoginPage() {
         try {
           const loggedInUser = await auth.login(username, password);
           // Log user login in audit ledger
-          await db.updateUser(loggedInUser.id, {}, loggedInUser); // triggers auto-log
+          await logAction(loggedInUser.id, loggedInUser.name, loggedInUser.role, `User Login`, `${loggedInUser.username} logged in`);
           router.push("/dashboard");
         } catch (err: any) {
           setError(err.message || "Invalid credentials");
