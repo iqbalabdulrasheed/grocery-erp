@@ -1,4 +1,4 @@
-// Grocery Warehouse ERP System - Database Service (Mocking localStorage + Supabase Connector)
+// Grocery Warehouse ERP System - Database Service (Supabase primary; localStorage fallback when Supabase is not configured)
 import { supabase } from './supabaseClient';
 
 export interface User {
@@ -30,16 +30,34 @@ export interface Product {
   deleted_at?: string | null;
 }
 
+export interface Warehouse {
+  id: string;
+  name: string;
+  location?: string;
+  created_at: string;
+  is_active: boolean;
+}
+
+export interface WarehouseStock {
+  id: string;
+  warehouse_id: string;
+  warehouse_name: string;
+  product_id: string;
+  qty: number;
+}
+
 export interface StockLedgerEntry {
   id: string;
   product_id: string;
   product_name: string;
   qty_change: number;
-  type: 'purchase' | 'supplier_return' | 'manual_adjustment' | 'customer_sales' | 'damage' | 'expired' | 'dispatch';
+  type: 'purchase' | 'supplier_return' | 'customer_return' | 'manual_adjustment' | 'customer_sales' | 'damage' | 'expired' | 'dispatch' | 'transfer_in' | 'transfer_out';
   notes: string;
   timestamp: string;
   user_id: string;
   user_name: string;
+  warehouse_id?: string;
+  warehouse_name?: string;
 }
 
 export interface OrderItem {
@@ -62,10 +80,14 @@ export interface Order {
   items: OrderItem[];
   subtotal: number;
   discount: number;
+  manual_discount_pct: number;
+  manual_discount_amt: number;
   total: number;
   assigned_staff_id?: string | null;
   assigned_staff_name?: string | null;
   delivery_route?: string | null;
+  warehouse_id?: string;
+  warehouse_name?: string;
   cod_tracking: boolean;
   cod_collected?: boolean;
   is_deleted?: boolean;
@@ -135,6 +157,9 @@ const initializeLocalStorage = () => {
     localStorage.setItem('customer_ledger', JSON.stringify(defaultCustomerLedger));
     localStorage.setItem('audit_logs', JSON.stringify([]));
     localStorage.setItem('expenses', JSON.stringify(defaultExpenses));
+    const defaultWarehouse: Warehouse[] = [{ id: 'wh-main', name: 'Main Warehouse', location: '', created_at: new Date().toISOString(), is_active: true }];
+    localStorage.setItem('warehouses', JSON.stringify(defaultWarehouse));
+    localStorage.setItem('warehouse_stock', JSON.stringify([]));
     localStorage.setItem('erp_initialized_v6', 'true');
   }
 };
@@ -363,7 +388,7 @@ export const db = {
     }
   },
 
-  createProduct: async (product: Omit<Product, 'id'>, actor: User): Promise<Product> => {
+  createProduct: async (product: Omit<Product, 'id'>, actor: User, warehouseId?: string): Promise<Product> => {
     const newProduct: Product = {
       ...product,
       id: `prod-${Date.now()}`
@@ -378,6 +403,27 @@ export const db = {
     }
 
     if (newProduct.stock_qty > 0) {
+      // Resolve warehouse name
+      let whName: string | undefined;
+      if (warehouseId) {
+        const whs = await db.getWarehouses();
+        whName = whs.find(w => w.id === warehouseId)?.name;
+        // Init warehouse_stock entry — Supabase or localStorage
+        const newWs: WarehouseStock = {
+          id: `ws-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          warehouse_id: warehouseId,
+          warehouse_name: whName || warehouseId,
+          product_id: newProduct.id,
+          qty: newProduct.stock_qty
+        };
+        if (supabase) {
+          const { error: wsErr } = await supabase.from('warehouse_stock').insert([newWs]);
+          if (wsErr) throw new Error(`warehouse_stock insert failed: ${wsErr.message}`);
+        } else {
+          const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
+          saveLocalTable('warehouse_stock', [...whStockList, newWs]);
+        }
+      }
       await db.addStockLedgerEntry({
         id: `stk-${Date.now()}`,
         product_id: newProduct.id,
@@ -387,7 +433,9 @@ export const db = {
         notes: 'Initial opening stock entry upon product creation',
         timestamp: new Date().toISOString(),
         user_id: actor.id,
-        user_name: actor.name
+        user_name: actor.name,
+        warehouse_id: warehouseId,
+        warehouse_name: whName
       });
     }
 
@@ -395,16 +443,34 @@ export const db = {
     return newProduct;
   },
 
-  updateProduct: async (id: string, updates: Partial<Product>, actor: User): Promise<Product> => {
+  updateProduct: async (id: string, updates: Partial<Product>, actor: User, warehouseId?: string): Promise<Product> => {
     const original = await db.getProductById(id);
     if (!original) throw new Error("Product not found");
 
+    // Strip any UI-only fields before sending to Supabase
+    const { ...safeUpdates } = updates as any;
+    delete safeUpdates._warehouseId;
+
     if (supabase) {
-      const { data, error } = await supabase.from('products').update(updates).eq('id', id).select().single();
+      const { data, error } = await supabase.from('products').update(safeUpdates).eq('id', id).select().single();
       if (error) throw error;
 
       if (updates.stock_qty !== undefined && updates.stock_qty !== original.stock_qty) {
         const diff = updates.stock_qty - original.stock_qty;
+        // Update warehouse_stock if a warehouse was selected
+        if (warehouseId) {
+          const warehouses = await db.getWarehouses();
+          const wh = warehouses.find(w => w.id === warehouseId);
+          if (wh) {
+            const { data: wsRows } = await supabase.from('warehouse_stock').select('*').eq('warehouse_id', warehouseId).eq('product_id', id);
+            if (wsRows && wsRows.length > 0) {
+              await supabase.from('warehouse_stock').update({ qty: Math.max(0, wsRows[0].qty + diff) }).eq('warehouse_id', warehouseId).eq('product_id', id);
+            } else {
+              await supabase.from('warehouse_stock').insert([{ id: `ws-${Date.now()}`, warehouse_id: warehouseId, warehouse_name: wh.name, product_id: id, qty: Math.max(0, diff) }]);
+            }
+          }
+        }
+        const whName = warehouseId ? (await db.getWarehouses()).find(w => w.id === warehouseId)?.name : undefined;
         await db.addStockLedgerEntry({
           id: `stk-${Date.now()}`,
           product_id: id,
@@ -414,19 +480,44 @@ export const db = {
           notes: 'Manual inventory stock adjust',
           timestamp: new Date().toISOString(),
           user_id: actor.id,
-          user_name: actor.name
+          user_name: actor.name,
+          warehouse_id: warehouseId,
+          warehouse_name: whName
         });
       }
       await logAction(actor.id, actor.name, actor.role, `Updated Product: ${data.name}`, JSON.stringify(updates));
       return data;
     } else {
       const products = getLocalTable<Product>('products');
-      const updatedProducts = products.map(p => (p.id === id ? { ...p, ...updates } : p));
+      const updatedProducts = products.map(p => (p.id === id ? { ...p, ...safeUpdates } : p));
       saveLocalTable('products', updatedProducts);
       const target = updatedProducts.find(p => p.id === id)!;
 
       if (updates.stock_qty !== undefined && updates.stock_qty !== original.stock_qty) {
         const diff = updates.stock_qty - original.stock_qty;
+        // Update warehouse_stock locally if a warehouse was selected
+        if (warehouseId) {
+          const warehouses = await db.getWarehouses();
+          const wh = warehouses.find(w => w.id === warehouseId);
+          const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
+          const existing = whStockList.find(ws => ws.warehouse_id === warehouseId && ws.product_id === id);
+          if (existing) {
+            saveLocalTable('warehouse_stock', whStockList.map(ws =>
+              ws.warehouse_id === warehouseId && ws.product_id === id
+                ? { ...ws, qty: Math.max(0, ws.qty + diff) }
+                : ws
+            ));
+          } else {
+            saveLocalTable('warehouse_stock', [...whStockList, {
+              id: `ws-${Date.now()}`,
+              warehouse_id: warehouseId,
+              warehouse_name: wh?.name || warehouseId,
+              product_id: id,
+              qty: Math.max(0, diff)
+            }]);
+          }
+        }
+        const whName = warehouseId ? (await db.getWarehouses()).find(w => w.id === warehouseId)?.name : undefined;
         await db.addStockLedgerEntry({
           id: `stk-${Date.now()}`,
           product_id: id,
@@ -436,7 +527,9 @@ export const db = {
           notes: 'Manual inventory stock adjust',
           timestamp: new Date().toISOString(),
           user_id: actor.id,
-          user_name: actor.name
+          user_name: actor.name,
+          warehouse_id: warehouseId,
+          warehouse_name: whName
         });
       }
       await logAction(actor.id, actor.name, actor.role, `Updated Product: ${target.name}`, JSON.stringify(updates));
@@ -508,19 +601,66 @@ export const db = {
     qtyChange: number,
     type: StockLedgerEntry['type'],
     notes: string,
-    actor: User
+    actor: User,
+    warehouseId?: string
   ): Promise<void> => {
     const product = await db.getProductById(productId);
     if (!product) return;
 
     const newQty = product.stock_qty + qtyChange;
     
-    // Update product stock
+    // Update product total stock
     if (supabase) {
       await supabase.from('products').update({ stock_qty: newQty }).eq('id', productId);
     } else {
       const products = getLocalTable<Product>('products');
       saveLocalTable('products', products.map(p => p.id === productId ? { ...p, stock_qty: newQty } : p));
+    }
+
+    // Update warehouse stock if warehouseId provided
+    if (warehouseId) {
+      const warehouses = await db.getWarehouses();
+      const wh = warehouses.find(w => w.id === warehouseId);
+      if (supabase) {
+        const { data: wsRows } = await supabase.from('warehouse_stock').select('*').eq('warehouse_id', warehouseId).eq('product_id', productId);
+        const existing = wsRows?.[0];
+        if (existing) {
+          await supabase.from('warehouse_stock').update({ qty: Math.max(0, existing.qty + qtyChange) }).eq('warehouse_id', warehouseId).eq('product_id', productId);
+        } else {
+          await supabase.from('warehouse_stock').insert([{
+            id: `ws-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+            warehouse_id: warehouseId,
+            warehouse_name: wh?.name || warehouseId,
+            product_id: productId,
+            qty: Math.max(0, qtyChange)
+          }]);
+        }
+      } else {
+        const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
+        const existing = whStockList.find(ws => ws.warehouse_id === warehouseId && ws.product_id === productId);
+        if (existing) {
+          saveLocalTable('warehouse_stock', whStockList.map(ws =>
+            ws.warehouse_id === warehouseId && ws.product_id === productId
+              ? { ...ws, qty: Math.max(0, ws.qty + qtyChange) }
+              : ws
+          ));
+        } else {
+          saveLocalTable('warehouse_stock', [...whStockList, {
+            id: `ws-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+            warehouse_id: warehouseId,
+            warehouse_name: wh?.name || warehouseId,
+            product_id: productId,
+            qty: Math.max(0, qtyChange)
+          }]);
+        }
+      }
+    }
+
+    // Resolve warehouse name for ledger
+    let whName: string | undefined;
+    if (warehouseId) {
+      const whs = await db.getWarehouses();
+      whName = whs.find(w => w.id === warehouseId)?.name;
     }
 
     // Insert entry
@@ -533,7 +673,9 @@ export const db = {
       notes,
       timestamp: new Date().toISOString(),
       user_id: actor.id,
-      user_name: actor.name
+      user_name: actor.name,
+      warehouse_id: warehouseId,
+      warehouse_name: whName
     };
     await db.addStockLedgerEntry(entry);
     await logAction(actor.id, actor.name, actor.role, `Stock Adjustment (${type}): ${product.name} by ${qtyChange} units`, notes);
@@ -579,7 +721,10 @@ export const db = {
     items: { product_id: string; qty: number }[],
     orderType: Order['type'],
     codTracking: boolean,
-    actor: User
+    actor: User,
+    manualDiscountPct: number = 0,
+    manualDiscountAmt: number = 0,
+    warehouseId?: string
   ): Promise<Order> => {
     const customer = await db.getUserById(customerId);
     if (!customer) throw new Error('Customer not found');
@@ -609,7 +754,11 @@ export const db = {
       });
     }
 
-    const total = Number((subtotal - totalDiscount).toFixed(2));
+    const afterCustomerDiscount = Number((subtotal - totalDiscount).toFixed(2));
+    const manualPctDeduction = Number(((afterCustomerDiscount * manualDiscountPct) / 100).toFixed(2));
+    const manualAmtDeduction = Number(Math.min(manualDiscountAmt, afterCustomerDiscount - manualPctDeduction).toFixed(2));
+    const totalManualDiscount = Number((manualPctDeduction + manualAmtDeduction).toFixed(2));
+    const total = Number((afterCustomerDiscount - totalManualDiscount).toFixed(2));
     
     if (customer.role === 'customer' && customer.credit_limit) {
       const currentOutstanding = customer.outstanding_balance || 0;
@@ -621,6 +770,12 @@ export const db = {
     let initialStatus: Order['status'] = 'created';
     if (['admin', 'superowner', 'owner', 'manager'].includes(actor.role)) {
       initialStatus = 'approved';
+    }
+
+    let whName: string | undefined;
+    if (warehouseId) {
+      const whs = await db.getWarehouses();
+      whName = whs.find(w => w.id === warehouseId)?.name;
     }
 
     const newOrder: Order = {
@@ -635,7 +790,11 @@ export const db = {
       items: orderItems,
       subtotal,
       discount: totalDiscount,
+      manual_discount_pct: manualDiscountPct,
+      manual_discount_amt: manualAmtDeduction,
       total,
+      warehouse_id: warehouseId,
+      warehouse_name: whName,
       cod_tracking: codTracking,
       status_history: [
         { status: 'created', updated_at: new Date().toISOString(), updated_by_name: actor.name }
@@ -651,7 +810,8 @@ export const db = {
     }
 
     if (supabase) {
-      await supabase.from('orders').insert([newOrder]);
+      const { error } = await supabase.from('orders').insert([newOrder]);
+      if (error) throw new Error(`Failed to save order: ${error.message}`);
     } else {
       const orders = getLocalTable<Order>('orders');
       saveLocalTable('orders', [...orders, newOrder]);
@@ -661,7 +821,7 @@ export const db = {
 
     if (initialStatus === 'approved') {
       for (const item of items) {
-        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Sales Reservation - Order ${newOrder.id}`, actor);
+        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Sales Reservation - Order ${newOrder.id}`, actor, warehouseId);
       }
     }
 
@@ -672,17 +832,20 @@ export const db = {
     orderId: string,
     newStatus: Order['status'],
     actor: User,
-    meta?: { assignedStaffId?: string; deliveryRoute?: string; codCollected?: boolean }
+    meta?: { assignedStaffId?: string; deliveryRoute?: string; codCollected?: boolean; cancelReason?: string }
   ): Promise<Order> => {
     const order = await db.getOrderById(orderId);
     if (!order) throw new Error('Order not found');
+
+    const historyEntry: any = { status: newStatus, updated_at: new Date().toISOString(), updated_by_name: actor.name };
+    if (meta?.cancelReason) historyEntry.notes = meta.cancelReason;
 
     const updated = {
       ...order,
       status: newStatus,
       status_history: [
         ...order.status_history,
-        { status: newStatus, updated_at: new Date().toISOString(), updated_by_name: actor.name }
+        historyEntry
       ]
     } as Order;
 
@@ -705,7 +868,14 @@ export const db = {
 
     if (order.status === 'created' && newStatus === 'approved') {
       for (const item of updated.items) {
-        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Sales Reservation - Order ${orderId}`, actor);
+        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Sales Reservation - Order ${orderId}`, actor, order.warehouse_id);
+      }
+    }
+
+    // Restore stock when order fails — reverses the reservation made at approval
+    if (newStatus === 'failed' && ['approved', 'packing', 'assigned', 'out_for_delivery'].includes(order.status)) {
+      for (const item of updated.items) {
+        await db.addStockAdjustment(item.product_id, item.qty, 'customer_return', `Stock Restored - Failed/Cancelled Order ${orderId}`, actor, order.warehouse_id);
       }
     }
 
@@ -952,6 +1122,136 @@ export const db = {
     else if (type === 'expense') await db.permanentlyDeleteExpense(id, actor);
   },
 
+  // WAREHOUSES
+  getWarehouses: async (): Promise<Warehouse[]> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('warehouses').select('*').eq('is_active', true);
+      if (error) return getLocalTable<Warehouse>('warehouses').filter(w => w.is_active);
+      return data || [];
+    } else {
+      const list = getLocalTable<Warehouse>('warehouses');
+      if (list.length === 0) {
+        const def: Warehouse[] = [{ id: 'wh-main', name: 'Main Warehouse', location: '', created_at: new Date().toISOString(), is_active: true }];
+        saveLocalTable('warehouses', def);
+        return def;
+      }
+      return list.filter(w => w.is_active);
+    }
+  },
+
+  createWarehouse: async (name: string, location: string, actor: User): Promise<Warehouse> => {
+    const wh: Warehouse = {
+      id: `wh-${Date.now()}`,
+      name,
+      location,
+      created_at: new Date().toISOString(),
+      is_active: true
+    };
+    if (supabase) {
+      const { error } = await supabase.from('warehouses').insert([wh]);
+      if (error) throw error;
+    } else {
+      const list = getLocalTable<Warehouse>('warehouses');
+      saveLocalTable('warehouses', [...list, wh]);
+    }
+    await logAction(actor.id, actor.name, actor.role, `Created Warehouse: ${name}`, `Location: ${location}`);
+    return wh;
+  },
+
+  updateWarehouse: async (id: string, updates: Partial<Warehouse>, actor: User): Promise<void> => {
+    if (supabase) {
+      await supabase.from('warehouses').update(updates).eq('id', id);
+    } else {
+      const list = getLocalTable<Warehouse>('warehouses');
+      saveLocalTable('warehouses', list.map(w => w.id === id ? { ...w, ...updates } : w));
+    }
+    await logAction(actor.id, actor.name, actor.role, `Updated Warehouse ${id}`, JSON.stringify(updates));
+  },
+
+  deleteWarehouse: async (id: string, actor: User): Promise<void> => {
+    if (supabase) {
+      await supabase.from('warehouses').update({ is_active: false }).eq('id', id);
+    } else {
+      const list = getLocalTable<Warehouse>('warehouses');
+      saveLocalTable('warehouses', list.map(w => w.id === id ? { ...w, is_active: false } : w));
+    }
+    await logAction(actor.id, actor.name, actor.role, `Deactivated Warehouse ${id}`, '', true);
+  },
+
+  getWarehouseStock: async (): Promise<WarehouseStock[]> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('warehouse_stock').select('*');
+      if (error) throw error;
+      return data || [];
+    }
+    return getLocalTable<WarehouseStock>('warehouse_stock');
+  },
+
+  transferStock: async (productId: string, fromWarehouseId: string, toWarehouseId: string, qty: number, actor: User): Promise<void> => {
+    const product = await db.getProductById(productId);
+    if (!product) throw new Error('Product not found');
+
+    const whs = await db.getWarehouses();
+    const fromWh = whs.find(w => w.id === fromWarehouseId);
+    const toWh = whs.find(w => w.id === toWarehouseId);
+
+    if (supabase) {
+      // Check source stock
+      const { data: fromRows } = await supabase.from('warehouse_stock').select('*').eq('warehouse_id', fromWarehouseId).eq('product_id', productId);
+      const fromStock = fromRows?.[0];
+      if (!fromStock || fromStock.qty < qty) throw new Error(`Insufficient stock in source warehouse (available: ${fromStock?.qty ?? 0})`);
+
+      // Deduct from source
+      await supabase.from('warehouse_stock').update({ qty: fromStock.qty - qty }).eq('warehouse_id', fromWarehouseId).eq('product_id', productId);
+
+      // Add to destination (upsert)
+      const { data: toRows } = await supabase.from('warehouse_stock').select('*').eq('warehouse_id', toWarehouseId).eq('product_id', productId);
+      const toStock = toRows?.[0];
+      if (toStock) {
+        await supabase.from('warehouse_stock').update({ qty: toStock.qty + qty }).eq('warehouse_id', toWarehouseId).eq('product_id', productId);
+      } else {
+        await supabase.from('warehouse_stock').insert([{
+          id: `ws-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          warehouse_id: toWarehouseId,
+          warehouse_name: toWh?.name || toWarehouseId,
+          product_id: productId,
+          qty
+        }]);
+      }
+    } else {
+      const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
+      const fromStock = whStockList.find(ws => ws.warehouse_id === fromWarehouseId && ws.product_id === productId);
+      if (!fromStock || fromStock.qty < qty) throw new Error(`Insufficient stock in source warehouse (available: ${fromStock?.qty ?? 0})`);
+
+      // Deduct from source
+      saveLocalTable('warehouse_stock', whStockList.map(ws =>
+        ws.warehouse_id === fromWarehouseId && ws.product_id === productId ? { ...ws, qty: ws.qty - qty } : ws
+      ));
+
+      // Add to destination
+      const updatedList = getLocalTable<WarehouseStock>('warehouse_stock');
+      const toStock = updatedList.find(ws => ws.warehouse_id === toWarehouseId && ws.product_id === productId);
+      if (toStock) {
+        saveLocalTable('warehouse_stock', updatedList.map(ws =>
+          ws.warehouse_id === toWarehouseId && ws.product_id === productId ? { ...ws, qty: ws.qty + qty } : ws
+        ));
+      } else {
+        saveLocalTable('warehouse_stock', [...updatedList, {
+          id: `ws-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          warehouse_id: toWarehouseId,
+          warehouse_name: toWh?.name || toWarehouseId,
+          product_id: productId,
+          qty
+        }]);
+      }
+    }
+
+    const ts = new Date().toISOString();
+    await db.addStockLedgerEntry({ id: `stk-${Date.now()}a`, product_id: productId, product_name: product.name, qty_change: -qty, type: 'transfer_out', notes: `Transfer to ${toWh?.name}`, timestamp: ts, user_id: actor.id, user_name: actor.name, warehouse_id: fromWarehouseId, warehouse_name: fromWh?.name });
+    await db.addStockLedgerEntry({ id: `stk-${Date.now()}b`, product_id: productId, product_name: product.name, qty_change: qty, type: 'transfer_in', notes: `Transfer from ${fromWh?.name}`, timestamp: ts, user_id: actor.id, user_name: actor.name, warehouse_id: toWarehouseId, warehouse_name: toWh?.name });
+    await logAction(actor.id, actor.name, actor.role, `Stock Transfer: ${product.name} x${qty}`, `From: ${fromWh?.name} → To: ${toWh?.name}`);
+  },
+
   wipeDatabase: async (actor: User): Promise<void> => {
     if (actor.role !== 'admin') throw new Error('Only admins can wipe the database.');
     if (supabase) {
@@ -972,6 +1272,9 @@ export const db = {
       saveLocalTable('customer_ledger', []);
       saveLocalTable('expenses', []);
       saveLocalTable('audit_logs', []);
+      const defaultWh: Warehouse[] = [{ id: 'wh-main', name: 'Main Warehouse', location: '', created_at: new Date().toISOString(), is_active: true }];
+      saveLocalTable('warehouses', defaultWh);
+      saveLocalTable('warehouse_stock', []);
     }
     await logAction(actor.id, actor.name, actor.role, `Wiped Database`, `Entire database cleared by admin.`);
   }

@@ -4,7 +4,25 @@ import React, { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { auth } from "@/services/auth";
 import { db, User, logAction } from "@/services/db";
+import { supabase } from "@/services/supabaseClient";
 import { Lock, User as UserIcon, Sparkles, AlertCircle } from "lucide-react";
+
+// Load theme: Supabase user_preferences → localStorage fallback
+async function loadTheme(): Promise<"dark" | "light"> {
+  if (supabase) {
+    try {
+      const { data } = await supabase
+        .from("user_preferences")
+        .select("theme")
+        .limit(1)
+        .single();
+      if (data?.theme === "dark" || data?.theme === "light") return data.theme as "dark" | "light";
+    } catch {
+      // table may not exist yet; fall through
+    }
+  }
+  return (localStorage.getItem("erp_theme") as "dark" | "light") || "dark";
+}
 
 export default function LoginPage() {
   const router = useRouter();
@@ -15,13 +33,14 @@ export default function LoginPage() {
 
   // Load theme and check if already logged in
   useEffect(() => {
-    const storedTheme = (localStorage.getItem("erp_theme") as "dark" | "light") || "dark";
-    document.documentElement.setAttribute("data-theme", storedTheme);
-    if (storedTheme === "dark") {
-      document.documentElement.classList.add("dark");
-    } else {
-      document.documentElement.classList.remove("dark");
-    }
+    loadTheme().then((storedTheme) => {
+      document.documentElement.setAttribute("data-theme", storedTheme);
+      if (storedTheme === "dark") {
+        document.documentElement.classList.add("dark");
+      } else {
+        document.documentElement.classList.remove("dark");
+      }
+    });
 
     const currentUser = auth.getCurrentUser();
     if (currentUser) {
