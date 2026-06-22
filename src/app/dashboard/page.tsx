@@ -11,7 +11,7 @@ import {
   X, AlertTriangle, ChevronRight, LogOut, Bell, FileText, Download, 
   Printer, DollarSign, Truck, PlusCircle, RotateCcw, HelpCircle, 
   CreditCard, Calendar, BarChart2, Activity, Settings, RefreshCcw,
-  Sun, Moon
+  Sun, Moon, Menu
 } from "lucide-react";
 import { 
   AreaChart, Area, BarChart, Bar, LineChart, Line, XAxis, YAxis, 
@@ -29,6 +29,7 @@ export default function DashboardPage() {
   const [activeTab, setActiveTab] = useState<string>("overview");
   const [theme, setTheme] = useState<"dark" | "light">("dark");
   const [mounted, setMounted] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   // Lists & State
   const [products, setProducts] = useState<Product[]>([]);
@@ -697,14 +698,21 @@ export default function DashboardPage() {
   const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
 
   return (
-    <div className="flex-1 flex flex-col md:flex-row h-screen overflow-hidden text-slate-700 dark:text-slate-200">
+    <div className="flex-1 flex flex-row h-screen overflow-hidden text-slate-700 dark:text-slate-200">
+      {/* MOBILE SIDEBAR OVERLAY */}
+      {sidebarOpen && (
+        <div 
+          className="fixed inset-0 bg-black/50 z-40 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
       {/* SIDEBAR */}
-      <aside className="w-full md:w-64 bg-slate-100 dark:bg-gray-950/60 border-r border-slate-200 dark:border-white/5 flex flex-col no-print">
-        <div className="p-6 border-b border-slate-200 dark:border-white/5 flex items-center gap-3">
-          <div className="w-9 h-9 rounded-lg bg-blue-600 flex justify-center items-center font-bold text-white shadow-lg">
+      <aside className={`fixed md:static inset-y-0 left-0 z-50 w-72 md:w-64 bg-slate-100 dark:bg-gray-950/60 border-r border-slate-200 dark:border-white/5 flex flex-col no-print transform transition-transform duration-300 ease-in-out ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:translate-x-0 md:flex-shrink-0`}>
+        <div className="p-5 border-b border-slate-200 dark:border-white/5 flex items-center gap-3">
+          <div className="w-9 h-9 rounded-lg bg-blue-600 flex justify-center items-center font-bold text-white shadow-lg shrink-0">
             Z
           </div>
-          <div>
+          <div className="flex-1 min-w-0">
             <h1 className="font-extrabold text-base tracking-tight text-slate-900 dark:text-white leading-tight">
               ZENVORA ERP
             </h1>
@@ -712,6 +720,13 @@ export default function DashboardPage() {
               {currentUser.role} Control
             </span>
           </div>
+          {/* Close button on mobile */}
+          <button
+            onClick={() => setSidebarOpen(false)}
+            className="md:hidden w-7 h-7 rounded-lg flex items-center justify-center text-slate-500 hover:text-slate-800 dark:text-gray-400 dark:hover:text-white hover:bg-slate-200 dark:hover:bg-white/10 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
         </div>
 
         {/* User Card */}
@@ -728,7 +743,7 @@ export default function DashboardPage() {
         {/* Nav Links */}
         <nav className="flex-1 px-4 space-y-1 overflow-y-auto">
           <button
-            onClick={() => setActiveTab("overview")}
+            onClick={() => { setActiveTab("overview"); setSidebarOpen(false); }}
             className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
               activeTab === "overview" 
                 ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -742,7 +757,7 @@ export default function DashboardPage() {
            {/* B2B Customer Pricing / Catalog */}
           {['admin', 'superowner', 'owner', 'manager', 'staff', 'customer', 'accountant'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("products")}
+              onClick={() => { setActiveTab("products"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "products" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -757,7 +772,7 @@ export default function DashboardPage() {
           {/* Stock adjustments & ledgers */}
           {['admin', 'superowner', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("inventory")}
+              onClick={() => { setActiveTab("inventory"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "inventory" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -771,7 +786,7 @@ export default function DashboardPage() {
 
           {/* Orders Tracking Pipeline */}
           <button
-            onClick={() => setActiveTab("orders")}
+            onClick={() => { setActiveTab("orders"); setSidebarOpen(false); }}
             className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
               activeTab === "orders" 
                 ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -785,7 +800,7 @@ export default function DashboardPage() {
           {/* Accounting Expense/Ledger */}
           {['admin', 'superowner', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("accounting")}
+              onClick={() => { setActiveTab("accounting"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "accounting" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -800,7 +815,7 @@ export default function DashboardPage() {
           {/* Users Creation RBAC */}
           {['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("users")}
+              onClick={() => { setActiveTab("users"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "users" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -815,7 +830,7 @@ export default function DashboardPage() {
           {/* Audit Trail Logs */}
           {['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("logs")}
+              onClick={() => { setActiveTab("logs"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "logs" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -830,7 +845,7 @@ export default function DashboardPage() {
           {/* Warehouses Management */}
           {['admin', 'owner', 'manager'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("warehouses")}
+              onClick={() => { setActiveTab("warehouses"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "warehouses" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -845,7 +860,7 @@ export default function DashboardPage() {
           {/* Soft Deleted Trash Recovery */}
           {['admin', 'superowner', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
             <button
-              onClick={() => setActiveTab("trash")}
+              onClick={() => { setActiveTab("trash"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "trash" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -873,10 +888,17 @@ export default function DashboardPage() {
       {/* MAIN CONTAINER */}
       <main className="flex-1 flex flex-col min-w-0 overflow-y-auto bg-slate-50 dark:bg-[#0b0f19] relative">
         {/* HEADER BAR */}
-        <header className="h-16 border-b border-slate-200 dark:border-white/5 flex items-center justify-between px-8 bg-white/60 dark:bg-gray-950/20 backdrop-blur-md sticky top-0 z-30 no-print">
-          <div className="flex items-center gap-4">
-            <span className="text-sm font-semibold text-slate-500 dark:text-gray-400 capitalize">
-              System Modules / {activeTab}
+        <header className="h-16 border-b border-slate-200 dark:border-white/5 flex items-center justify-between px-4 md:px-8 bg-white/60 dark:bg-gray-950/20 backdrop-blur-md sticky top-0 z-30 no-print">
+          <div className="flex items-center gap-3">
+            {/* Hamburger for mobile */}
+            <button
+              onClick={() => setSidebarOpen(true)}
+              className="md:hidden w-9 h-9 rounded-lg bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border border-slate-200 dark:border-white/5 flex justify-center items-center text-slate-600 dark:text-gray-400"
+            >
+              <Menu className="w-4 h-4" />
+            </button>
+            <span className="text-sm font-semibold text-slate-500 dark:text-gray-400 capitalize truncate">
+              {activeTab}
             </span>
           </div>
 
@@ -903,7 +925,7 @@ export default function DashboardPage() {
               </button>
 
               {showNotifications && (
-                <div className="absolute right-0 mt-2 w-80 glass-panel rounded-xl border border-slate-200 dark:border-white/5 shadow-2xl p-4 z-50">
+                <div className="absolute right-0 mt-2 w-[calc(100vw-2rem)] max-w-xs sm:w-80 glass-panel rounded-xl border border-slate-200 dark:border-white/5 shadow-2xl p-4 z-50">
                   <h3 className="text-xs font-bold text-slate-900 dark:text-white mb-3 uppercase tracking-wider">Alert notifications</h3>
                   <div className="space-y-2.5 max-h-60 overflow-y-auto">
                     {notifications.length === 0 ? (
@@ -936,11 +958,11 @@ export default function DashboardPage() {
         </header>
 
         {/* MODULE CONTAINER */}
-        <div className="p-8 flex-1 animate-fade-in print-card">
+        <div className="p-4 md:p-8 flex-1 animate-fade-in print-card">
           
           {/* TAB 1: OVERVIEW */}
           {activeTab === "overview" && (
-            <div className="space-y-8 print-card">
+            <div className="space-y-5 md:space-y-8 print-card">
               <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 no-print">
                 <div>
                   <h2 className="text-2xl font-extrabold text-slate-950 dark:text-white">Marhaba, {currentUser.name}!</h2>
@@ -1370,7 +1392,7 @@ export default function DashboardPage() {
               </div>
 
               {/* PRODUCTS LIST TABLE */}
-              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                 <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
                   <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
                     <tr>
@@ -1596,7 +1618,7 @@ export default function DashboardPage() {
               </div>
 
               {/* STOCK LEDGER TABLE */}
-              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                 <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
                   <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
                     <tr>
@@ -2194,7 +2216,7 @@ export default function DashboardPage() {
             };
 
             return (
-            <div className="space-y-8">
+            <div className="space-y-5 md:space-y-8">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
                   <h2 className="text-xl font-bold text-slate-950 dark:text-white">Accounting Ledger & Profits</h2>
@@ -2279,7 +2301,7 @@ export default function DashboardPage() {
                 </div>
 
                 {/* CUSTOMER TABLE WITH INLINE LEDGER */}
-                <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+                <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                   <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
                     <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
                       <tr>
@@ -2466,7 +2488,7 @@ export default function DashboardPage() {
                 )}
               </div>
 
-              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                 <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
                   <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
                     <tr>
@@ -2587,7 +2609,7 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                 <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
                   <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
                     <tr>
@@ -2704,7 +2726,7 @@ export default function DashboardPage() {
               </div>
 
               {/* Stock by warehouse table */}
-              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                 <div className="p-4 border-b border-slate-100 dark:border-white/5">
                   <h3 className="text-sm font-bold text-slate-900 dark:text-white">Full Stock Breakdown by Warehouse</h3>
                 </div>
@@ -2755,7 +2777,7 @@ export default function DashboardPage() {
                 <p className="text-xs text-slate-500 dark:text-gray-400">Review deleted products, orders, customers, and users. Restore them, or command permanent purge (Admin only).</p>
               </div>
 
-              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden">
+              <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
                 <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
                   <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
                     <tr>
