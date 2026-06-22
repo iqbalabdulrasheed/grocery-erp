@@ -1524,7 +1524,7 @@ export default function DashboardPage() {
                   {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
                     <button
                       onClick={() => {
-                        setStockForm({ productId: products[0]?.id || "", qty: 0, type: "purchase", notes: "" });
+                        setStockForm({ productId: products[0]?.id || "", qty: 0, type: "purchase", notes: "", warehouseId: "" });
                         setShowStockModal(true);
                       }}
                       className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-bold text-white cursor-pointer"
