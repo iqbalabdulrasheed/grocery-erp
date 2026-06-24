@@ -3238,13 +3238,17 @@ export default function DashboardPage() {
                 {/* ---- EXPENSES SUB-TAB ---- */}
                 {accountingSubTab === 'expenses' && (() => {
                   const expenseCategories = ['Utilities','Rent','Maintenance','Salaries','Fuel/Transport','Other'];
-                  const filteredExpenses = expenses.filter((ex: any) => {
-                    if (expenseFilterCategory && ex.category !== expenseFilterCategory) return false;
-                    if (expenseFilterFrom && ex.timestamp.split('T')[0] < expenseFilterFrom) return false;
-                    if (expenseFilterTo && ex.timestamp.split('T')[0] > expenseFilterTo) return false;
-                    return true;
-                  }).sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-                  const filteredTotal = filteredExpenses.reduce((s: number, e: any) => s + e.amount, 0);
+                  const filteredExpenses = expenses
+                    .filter((ex: any) => {
+                      if (expenseFilterCategory && ex.category !== expenseFilterCategory) return false;
+                      const exDate = (ex.timestamp || '').split('T')[0];
+                      if (expenseFilterFrom && exDate < expenseFilterFrom) return false;
+                      if (expenseFilterTo && exDate > expenseFilterTo) return false;
+                      return true;
+                    })
+                    .slice()
+                    .sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+                  const filteredTotal = filteredExpenses.reduce((s: number, e: any) => s + (Number(e.amount) || 0), 0);
                   return (
                   <div className="space-y-4">
                     {/* Filters */}
