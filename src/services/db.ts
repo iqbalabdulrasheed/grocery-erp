@@ -66,6 +66,11 @@ export interface OrderItem {
   qty: number;
   unit_price: number;
   total: number;
+  warehouse_id?: string;
+  warehouse_name?: string;
+  // For split fulfillment: array of { warehouse_id, warehouse_name, qty } when
+  // stock is taken from multiple warehouses for a single item
+  split_warehouses?: { warehouse_id: string; warehouse_name: string; qty: number }[];
 }
 
 export interface Order {
@@ -96,6 +101,7 @@ export interface Order {
     status: Order['status'];
     updated_at: string;
     updated_by_name: string;
+    notes?: string;
   }[];
 }
 
@@ -129,6 +135,47 @@ export interface Expense {
   timestamp: string;
   is_deleted?: boolean;
   deleted_at?: string | null;
+  user_id?: string;
+  user_name?: string;
+}
+
+export interface StockReservation {
+  id: string;
+  order_id: string;
+  product_id: string;
+  warehouse_id: string;
+  qty: number;
+  status: 'active' | 'completed' | 'cancelled';
+  created_at: string;
+}
+
+export interface PickListItem {
+  product_id: string;
+  name: string;
+  qty: number;
+  warehouse_id: string;
+  warehouse_name: string;
+  picked_qty: number;
+}
+
+export interface PickList {
+  id: string;
+  order_id: string;
+  items: PickListItem[];
+  status: 'pending' | 'picking' | 'completed' | 'cancelled';
+  created_at: string;
+}
+
+export interface Dispatch {
+  id: string;
+  order_id: string;
+  status: 'dispatched' | 'delivered' | 'failed';
+  dispatched_at: string;
+  delivered_at?: string | null;
+  dispatched_by_id: string;
+  dispatched_by_name: string;
+  carrier_details?: string | null;
+  notes?: string | null;
 }
 
 const isClient = typeof window !== 'undefined';
@@ -160,6 +207,9 @@ const initializeLocalStorage = () => {
     const defaultWarehouse: Warehouse[] = [{ id: 'wh-main', name: 'Main Warehouse', location: '', created_at: new Date().toISOString(), is_active: true }];
     localStorage.setItem('warehouses', JSON.stringify(defaultWarehouse));
     localStorage.setItem('warehouse_stock', JSON.stringify([]));
+    localStorage.setItem('stock_reservations', JSON.stringify([]));
+    localStorage.setItem('pick_lists', JSON.stringify([]));
+    localStorage.setItem('dispatches', JSON.stringify([]));
     localStorage.setItem('erp_initialized_v6', 'true');
   }
 };
@@ -364,28 +414,40 @@ export const db = {
     }
   },
 
-  // PRODUCTS
   getProducts: async (includeDeleted = false): Promise<Product[]> => {
+    let list: Product[] = [];
     if (supabase) {
       const query = supabase.from('products').select('*');
       const { data, error } = includeDeleted ? await query : await query.eq('is_deleted', false);
       if (error) throw error;
-      return data || [];
+      list = data || [];
     } else {
-      const list = getLocalTable<Product>('products');
-      return includeDeleted ? list : list.filter(p => !p.is_deleted);
+      const rawList = getLocalTable<Product>('products');
+      list = includeDeleted ? rawList : rawList.filter(p => !p.is_deleted);
     }
+    const whStock = await db.getWarehouseStock();
+    return list.map(p => {
+      const qty = whStock.filter(ws => ws.product_id === p.id).reduce((sum, ws) => sum + ws.qty, 0);
+      return { ...p, stock_qty: qty };
+    });
   },
 
   getProductById: async (id: string): Promise<Product | undefined> => {
+    let product: Product | undefined;
     if (supabase) {
       const { data, error } = await supabase.from('products').select('*').eq('id', id).single();
       if (error) return undefined;
-      return data;
+      product = data;
     } else {
       const list = getLocalTable<Product>('products');
-      return list.find(p => p.id === id);
+      product = list.find(p => p.id === id);
     }
+    if (product) {
+      const whStock = await db.getWarehouseStock();
+      const qty = whStock.filter(ws => ws.product_id === product!.id).reduce((sum, ws) => sum + ws.qty, 0);
+      product.stock_qty = qty;
+    }
+    return product;
   },
 
   createProduct: async (product: Omit<Product, 'id'>, actor: User, warehouseId?: string): Promise<Product> => {
@@ -394,12 +456,15 @@ export const db = {
       id: `prod-${Date.now()}`
     };
 
+    // Remove stock_qty before inserting into products database table
+    const { stock_qty, ...dbProduct } = newProduct as any;
+
     if (supabase) {
-      const { error } = await supabase.from('products').insert([newProduct]);
+      const { error } = await supabase.from('products').insert([dbProduct]);
       if (error) throw error;
     } else {
       const products = getLocalTable<Product>('products');
-      saveLocalTable('products', [...products, newProduct]);
+      saveLocalTable('products', [...products, dbProduct]);
     }
 
     if (newProduct.stock_qty > 0) {
@@ -447,94 +512,84 @@ export const db = {
     const original = await db.getProductById(id);
     if (!original) throw new Error("Product not found");
 
-    // Strip any UI-only fields before sending to Supabase
-    const { ...safeUpdates } = updates as any;
+    // Strip stock_qty from product table updates
+    const { stock_qty, ...safeUpdates } = updates as any;
     delete safeUpdates._warehouseId;
 
+    let updatedProduct: Product;
     if (supabase) {
-      const { data, error } = await supabase.from('products').update(safeUpdates).eq('id', id).select().single();
-      if (error) throw error;
+      if (Object.keys(safeUpdates).length === 0) {
+        const { data, error } = await supabase.from('products').select('*').eq('id', id).single();
+        if (error) throw error;
+        updatedProduct = data;
+      } else {
+        const { data, error } = await supabase.from('products').update(safeUpdates).eq('id', id).select().single();
+        if (error) throw error;
+        updatedProduct = data;
+      }
+    } else {
+      const products = getLocalTable<Product>('products');
+      const updatedProducts = products.map(p => (p.id === id ? { ...p, ...safeUpdates } : p));
+      saveLocalTable('products', updatedProducts);
+      updatedProduct = updatedProducts.find(p => p.id === id)!;
+    }
 
-      if (updates.stock_qty !== undefined && updates.stock_qty !== original.stock_qty) {
-        const diff = updates.stock_qty - original.stock_qty;
-        // Update warehouse_stock if a warehouse was selected
-        if (warehouseId) {
-          const warehouses = await db.getWarehouses();
-          const wh = warehouses.find(w => w.id === warehouseId);
-          if (wh) {
+    if (updates.stock_qty !== undefined && updates.stock_qty !== original.stock_qty) {
+      const diff = updates.stock_qty - original.stock_qty;
+      // Update warehouse_stock if a warehouse was selected
+      if (warehouseId) {
+        const warehouses = await db.getWarehouses();
+        const wh = warehouses.find(w => w.id === warehouseId);
+        if (wh) {
+          if (supabase) {
             const { data: wsRows } = await supabase.from('warehouse_stock').select('*').eq('warehouse_id', warehouseId).eq('product_id', id);
             if (wsRows && wsRows.length > 0) {
               await supabase.from('warehouse_stock').update({ qty: Math.max(0, wsRows[0].qty + diff) }).eq('warehouse_id', warehouseId).eq('product_id', id);
             } else {
               await supabase.from('warehouse_stock').insert([{ id: `ws-${Date.now()}`, warehouse_id: warehouseId, warehouse_name: wh.name, product_id: id, qty: Math.max(0, diff) }]);
             }
-          }
-        }
-        const whName = warehouseId ? (await db.getWarehouses()).find(w => w.id === warehouseId)?.name : undefined;
-        await db.addStockLedgerEntry({
-          id: `stk-${Date.now()}`,
-          product_id: id,
-          product_name: data.name,
-          qty_change: diff,
-          type: 'manual_adjustment',
-          notes: 'Manual inventory stock adjust',
-          timestamp: new Date().toISOString(),
-          user_id: actor.id,
-          user_name: actor.name,
-          warehouse_id: warehouseId,
-          warehouse_name: whName
-        });
-      }
-      await logAction(actor.id, actor.name, actor.role, `Updated Product: ${data.name}`, JSON.stringify(updates));
-      return data;
-    } else {
-      const products = getLocalTable<Product>('products');
-      const updatedProducts = products.map(p => (p.id === id ? { ...p, ...safeUpdates } : p));
-      saveLocalTable('products', updatedProducts);
-      const target = updatedProducts.find(p => p.id === id)!;
-
-      if (updates.stock_qty !== undefined && updates.stock_qty !== original.stock_qty) {
-        const diff = updates.stock_qty - original.stock_qty;
-        // Update warehouse_stock locally if a warehouse was selected
-        if (warehouseId) {
-          const warehouses = await db.getWarehouses();
-          const wh = warehouses.find(w => w.id === warehouseId);
-          const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
-          const existing = whStockList.find(ws => ws.warehouse_id === warehouseId && ws.product_id === id);
-          if (existing) {
-            saveLocalTable('warehouse_stock', whStockList.map(ws =>
-              ws.warehouse_id === warehouseId && ws.product_id === id
-                ? { ...ws, qty: Math.max(0, ws.qty + diff) }
-                : ws
-            ));
           } else {
-            saveLocalTable('warehouse_stock', [...whStockList, {
-              id: `ws-${Date.now()}`,
-              warehouse_id: warehouseId,
-              warehouse_name: wh?.name || warehouseId,
-              product_id: id,
-              qty: Math.max(0, diff)
-            }]);
+            const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
+            const existing = whStockList.find(ws => ws.warehouse_id === warehouseId && ws.product_id === id);
+            if (existing) {
+              saveLocalTable('warehouse_stock', whStockList.map(ws =>
+                ws.warehouse_id === warehouseId && ws.product_id === id
+                  ? { ...ws, qty: Math.max(0, ws.qty + diff) }
+                  : ws
+              ));
+            } else {
+              saveLocalTable('warehouse_stock', [...whStockList, {
+                id: `ws-${Date.now()}`,
+                warehouse_id: warehouseId,
+                warehouse_name: wh.name,
+                product_id: id,
+                qty: Math.max(0, diff)
+              }]);
+            }
           }
         }
-        const whName = warehouseId ? (await db.getWarehouses()).find(w => w.id === warehouseId)?.name : undefined;
-        await db.addStockLedgerEntry({
-          id: `stk-${Date.now()}`,
-          product_id: id,
-          product_name: target.name,
-          qty_change: diff,
-          type: 'manual_adjustment',
-          notes: 'Manual inventory stock adjust',
-          timestamp: new Date().toISOString(),
-          user_id: actor.id,
-          user_name: actor.name,
-          warehouse_id: warehouseId,
-          warehouse_name: whName
-        });
       }
-      await logAction(actor.id, actor.name, actor.role, `Updated Product: ${target.name}`, JSON.stringify(updates));
-      return target;
+      const whName = warehouseId ? (await db.getWarehouses()).find(w => w.id === warehouseId)?.name : undefined;
+      await db.addStockLedgerEntry({
+        id: `stk-${Date.now()}`,
+        product_id: id,
+        product_name: updatedProduct.name,
+        qty_change: diff,
+        type: 'manual_adjustment',
+        notes: 'Manual inventory stock adjust',
+        timestamp: new Date().toISOString(),
+        user_id: actor.id,
+        user_name: actor.name,
+        warehouse_id: warehouseId,
+        warehouse_name: whName
+      });
     }
+
+    const whStock = await db.getWarehouseStock();
+    updatedProduct.stock_qty = whStock.filter(ws => ws.product_id === id).reduce((sum, ws) => sum + ws.qty, 0);
+
+    await logAction(actor.id, actor.name, actor.role, `Updated Product: ${updatedProduct.name}`, JSON.stringify(updates));
+    return updatedProduct;
   },
 
   deleteProduct: async (id: string, actor: User): Promise<void> => {
@@ -606,16 +661,6 @@ export const db = {
   ): Promise<void> => {
     const product = await db.getProductById(productId);
     if (!product) return;
-
-    const newQty = product.stock_qty + qtyChange;
-    
-    // Update product total stock
-    if (supabase) {
-      await supabase.from('products').update({ stock_qty: newQty }).eq('id', productId);
-    } else {
-      const products = getLocalTable<Product>('products');
-      saveLocalTable('products', products.map(p => p.id === productId ? { ...p, stock_qty: newQty } : p));
-    }
 
     // Update warehouse stock if warehouseId provided
     if (warehouseId) {
@@ -820,9 +865,36 @@ export const db = {
     await logAction(actor.id, actor.name, actor.role, `Created Order ${newOrder.id}`, `Total: ${total} SAR`);
 
     if (initialStatus === 'approved') {
-      for (const item of items) {
-        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Sales Reservation - Order ${newOrder.id}`, actor, warehouseId);
+      for (const item of orderItems) {
+        const finalWhId = item.warehouse_id || warehouseId || 'wh-main';
+        const finalWhName = item.warehouse_name || whName || 'Main Warehouse';
+        // Reserve for UI tracking
+        await db.createReservation({
+          order_id: newOrder.id,
+          product_id: item.product_id,
+          warehouse_id: finalWhId,
+          qty: item.qty,
+          status: 'active'
+        });
+        // Immediately deduct from physical stock → moves to temp storage
+        await db.addStockAdjustment(
+          item.product_id,
+          -item.qty,
+          'customer_sales',
+          `Order ${newOrder.id} approved — moved to temp storage (${finalWhName})`,
+          actor,
+          finalWhId
+        );
       }
+      const pickItems: PickListItem[] = orderItems.map(item => ({
+        product_id: item.product_id,
+        name: item.name,
+        qty: item.qty,
+        warehouse_id: item.warehouse_id || warehouseId || 'wh-main',
+        warehouse_name: item.warehouse_name || whName || 'Main Warehouse',
+        picked_qty: 0
+      }));
+      await db.createPickList(newOrder.id, pickItems);
     }
 
     return newOrder;
@@ -867,15 +939,197 @@ export const db = {
     await logAction(actor.id, actor.name, actor.role, `Updated Order ${orderId} Status to: ${newStatus}`);
 
     if (order.status === 'created' && newStatus === 'approved') {
+      const pickItems: PickListItem[] = [];
       for (const item of updated.items) {
-        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Sales Reservation - Order ${orderId}`, actor, order.warehouse_id);
+        const splitWh = (item as any).split_warehouses as { warehouse_id: string; warehouse_name: string; qty: number }[] | undefined;
+
+        if (splitWh && splitWh.length > 1) {
+          // SPLIT: deduct each portion from its warehouse and create a reservation per portion
+          for (const portion of splitWh) {
+            if (portion.qty <= 0) continue;
+            await db.createReservation({
+              order_id: orderId,
+              product_id: item.product_id,
+              warehouse_id: portion.warehouse_id,
+              qty: portion.qty,
+              status: 'active'
+            });
+            await db.addStockAdjustment(
+              item.product_id,
+              -portion.qty,
+              'customer_sales',
+              `Order ${orderId} approved — moved to temp storage (${portion.warehouse_name})`,
+              actor,
+              portion.warehouse_id
+            );
+          }
+          pickItems.push({
+            product_id: item.product_id,
+            name: item.name,
+            qty: item.qty,
+            warehouse_id: (item as any).warehouse_id || order.warehouse_id || splitWh[0].warehouse_id,
+            warehouse_name: `Split: ${splitWh.map(p => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
+            picked_qty: 0
+          });
+        } else {
+          // SINGLE warehouse
+          const finalWhId = (item as any).warehouse_id || order.warehouse_id || 'wh-main';
+          const finalWhName = (item as any).warehouse_name || order.warehouse_name || 'Main Warehouse';
+          await db.createReservation({
+            order_id: orderId,
+            product_id: item.product_id,
+            warehouse_id: finalWhId,
+            qty: item.qty,
+            status: 'active'
+          });
+          await db.addStockAdjustment(
+            item.product_id,
+            -item.qty,
+            'customer_sales',
+            `Order ${orderId} approved — moved to temp storage (${finalWhName})`,
+            actor,
+            finalWhId
+          );
+          pickItems.push({
+            product_id: item.product_id,
+            name: item.name,
+            qty: item.qty,
+            warehouse_id: finalWhId,
+            warehouse_name: finalWhName,
+            picked_qty: 0
+          });
+        }
+      }
+      await db.createPickList(orderId, pickItems);
+    }
+
+    if (newStatus === 'packing') {
+      const pls = await db.getPickLists();
+      const pl = pls.find(p => p.order_id === orderId && p.status === 'pending');
+      if (pl) {
+        await db.updatePickList(pl.id, { status: 'picking' });
       }
     }
 
-    // Restore stock when order fails — reverses the reservation made at approval
-    if (newStatus === 'failed' && ['approved', 'packing', 'assigned', 'out_for_delivery'].includes(order.status)) {
+    if (newStatus === 'assigned') {
+      const pls = await db.getPickLists();
+      const pl = pls.find(p => p.order_id === orderId && ['pending', 'picking'].includes(p.status));
+      if (pl) {
+        const updatedItems = pl.items.map(item => ({ ...item, picked_qty: item.qty }));
+        await db.updatePickList(pl.id, { status: 'completed', items: updatedItems });
+      }
+    }
+
+    if (newStatus === 'out_for_delivery') {
+      // Stock was already deducted from warehouse at approval (moved to temp storage).
+      // At dispatch we just record the dispatch event and close out reservations.
+      await db.createDispatch({
+        order_id: orderId,
+        status: 'dispatched',
+        dispatched_by_id: actor.id,
+        dispatched_by_name: actor.name,
+        carrier_details: updated.delivery_route || 'Standard Route',
+        notes: `Dispatched by ${actor.name}`
+      });
+
+      const reservations = await db.getReservations();
+      const activeRes = reservations.filter(r => r.order_id === orderId && r.status === 'active');
+      for (const r of activeRes) {
+        await db.updateReservationStatus(r.id, 'completed');
+      }
+
+      // Log dispatch ledger entries (informational — no stock qty change, already deducted)
       for (const item of updated.items) {
-        await db.addStockAdjustment(item.product_id, item.qty, 'customer_return', `Stock Restored - Failed/Cancelled Order ${orderId}`, actor, order.warehouse_id);
+        const splitWh = (item as any).split_warehouses as { warehouse_id: string; warehouse_name: string; qty: number }[] | undefined;
+        const itemWarehouse = (item as any).warehouse_id || updated.warehouse_id;
+        const whLabel = splitWh ? splitWh.map(p => p.warehouse_name).join(', ') : (itemWarehouse || 'warehouse');
+        await logAction(actor.id, actor.name, actor.role, `Dispatched Order ${orderId}`, `${item.name} ×${item.qty} from ${whLabel}`);
+      }
+
+      const pls = await db.getPickLists();
+      const pl = pls.find(p => p.order_id === orderId && p.status !== 'completed');
+      if (pl) {
+        await db.updatePickList(pl.id, { status: 'completed' });
+      }
+    }
+
+    if (newStatus === 'delivered') {
+      const dps = await db.getDispatches();
+      const dp = dps.find(d => d.order_id === orderId && d.status === 'dispatched');
+      if (dp) {
+        if (supabase) {
+          await supabase.from('dispatches').update({ status: 'delivered', delivered_at: new Date().toISOString() }).eq('id', dp.id);
+        } else {
+          const list = getLocalTable<Dispatch>('dispatches');
+          saveLocalTable('dispatches', list.map(d => d.id === dp.id ? { ...d, status: 'delivered', delivered_at: new Date().toISOString() } : d));
+        }
+      }
+    }
+
+    if (newStatus === 'failed') {
+      const wasApproved = ['approved', 'packing', 'assigned'].includes(order.status);
+      const wasDispatched = order.status === 'out_for_delivery' || order.status === 'delivered';
+
+      if (wasApproved) {
+        // Stock was deducted at approval (temp storage). Return it back to the warehouse now.
+        const reservations = await db.getReservations();
+        const activeRes = reservations.filter(r => r.order_id === orderId && r.status === 'active');
+        for (const r of activeRes) {
+          await db.updateReservationStatus(r.id, 'cancelled');
+          // Return stock from temp storage back to warehouse
+          await db.addStockAdjustment(
+            r.product_id,
+            r.qty,
+            'customer_return',
+            `Order ${orderId} cancelled before dispatch — stock returned to warehouse`,
+            actor,
+            r.warehouse_id
+          );
+        }
+
+        const pls = await db.getPickLists();
+        const pl = pls.find(p => p.order_id === orderId);
+        if (pl) {
+          await db.updatePickList(pl.id, { status: 'cancelled' });
+        }
+
+        // Write STOCK_RESTORED marker so the Returns tab sees this order as already
+        // handled and does NOT show the "Return to Stock" button — preventing double-returns.
+        const restoredMarker = {
+          status: 'failed' as const,
+          updated_at: new Date().toISOString(),
+          updated_by_name: `STOCK_RESTORED:${actor.name}`
+        };
+        updated.status_history = [...updated.status_history, restoredMarker];
+        if (supabase) {
+          await supabase.from('orders').update({ status_history: updated.status_history }).eq('id', orderId);
+        } else {
+          const orders = getLocalTable<Order>('orders');
+          saveLocalTable('orders', orders.map(o => o.id === orderId ? { ...o, status_history: updated.status_history } : o));
+        }
+      } else if (wasDispatched) {
+        // Order was already dispatched — mark dispatch as failed.
+        // Stock return handled manually via Returns tab.
+        const dps = await db.getDispatches();
+        const dp = dps.find(d => d.order_id === orderId && d.status === 'dispatched');
+        if (dp) {
+          if (supabase) {
+            await supabase.from('dispatches').update({ status: 'failed' }).eq('id', dp.id);
+          } else {
+            const list = getLocalTable<Dispatch>('dispatches');
+            saveLocalTable('dispatches', list.map(d => d.id === dp.id ? { ...d, status: 'failed' } : d));
+          }
+        }
+      } else {
+        // created status — stock was never deducted, just clean up
+        const reservations = await db.getReservations();
+        const activeRes = reservations.filter(r => r.order_id === orderId && r.status === 'active');
+        for (const r of activeRes) {
+          await db.updateReservationStatus(r.id, 'cancelled');
+        }
+        const pls = await db.getPickLists();
+        const pl = pls.find(p => p.order_id === orderId);
+        if (pl) await db.updatePickList(pl.id, { status: 'cancelled' });
       }
     }
 
@@ -907,6 +1161,43 @@ export const db = {
     }
 
     return updated;
+  },
+
+  updateOrderWarehouse: async (orderId: string, warehouseId: string, warehouseName: string, actor: User): Promise<void> => {
+    if (supabase) {
+      await supabase.from('orders').update({ warehouse_id: warehouseId, warehouse_name: warehouseName }).eq('id', orderId);
+    } else {
+      const orders = getLocalTable<Order>('orders');
+      saveLocalTable('orders', orders.map(o => o.id === orderId ? { ...o, warehouse_id: warehouseId, warehouse_name: warehouseName } : o));
+    }
+    await logAction(actor.id, actor.name, actor.role, `Set warehouse for Order ${orderId} to: ${warehouseName}`);
+  },
+
+  saveOrderItemWarehouses: async (
+    orderId: string,
+    itemSelections: Record<string, { warehouseId: string; warehouseName: string; splitWarehouses?: { warehouse_id: string; warehouse_name: string; qty: number }[] }>,
+    actor: User
+  ): Promise<void> => {
+    const order = await db.getOrderById(orderId);
+    if (!order) throw new Error('Order not found');
+    const updatedItems = order.items.map(item => {
+      const sel = itemSelections[item.product_id];
+      if (!sel) return item;
+      const base = { ...item, warehouse_id: sel.warehouseId, warehouse_name: sel.warehouseName };
+      if (sel.splitWarehouses && sel.splitWarehouses.length > 1) {
+        return { ...base, split_warehouses: sel.splitWarehouses };
+      }
+      // Single warehouse — clear any stale split data
+      const { split_warehouses, ...clean } = base as any;
+      return clean;
+    });
+    if (supabase) {
+      await supabase.from('orders').update({ items: updatedItems }).eq('id', orderId);
+    } else {
+      const orders = getLocalTable<Order>('orders');
+      saveLocalTable('orders', orders.map(o => o.id === orderId ? { ...o, items: updatedItems } : o));
+    }
+    await logAction(actor.id, actor.name, actor.role, `Assigned per-item warehouses for Order ${orderId}`);
   },
 
   deleteOrder: async (id: string, actor: User): Promise<void> => {
@@ -1252,15 +1543,126 @@ export const db = {
     await logAction(actor.id, actor.name, actor.role, `Stock Transfer: ${product.name} x${qty}`, `From: ${fromWh?.name} → To: ${toWh?.name}`);
   },
 
+  // RESERVATIONS
+  getReservations: async (): Promise<StockReservation[]> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('stock_reservation').select('*').order('created_at', { ascending: false });
+      if (error) throw error;
+      return data || [];
+    } else {
+      return getLocalTable<StockReservation>('stock_reservations');
+    }
+  },
+
+  createReservation: async (reservation: Omit<StockReservation, 'id' | 'created_at'>): Promise<StockReservation> => {
+    const newRes: StockReservation = {
+      ...reservation,
+      id: `res-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      created_at: new Date().toISOString()
+    };
+    if (supabase) {
+      const { error } = await supabase.from('stock_reservation').insert([newRes]);
+      if (error) throw error;
+    } else {
+      const list = getLocalTable<StockReservation>('stock_reservations');
+      saveLocalTable('stock_reservations', [newRes, ...list]);
+    }
+    return newRes;
+  },
+
+  updateReservationStatus: async (id: string, status: StockReservation['status']): Promise<void> => {
+    if (supabase) {
+      const { error } = await supabase.from('stock_reservation').update({ status }).eq('id', id);
+      if (error) throw error;
+    } else {
+      const list = getLocalTable<StockReservation>('stock_reservations');
+      saveLocalTable('stock_reservations', list.map(r => r.id === id ? { ...r, status } : r));
+    }
+  },
+
+  // PICK LISTS
+  getPickLists: async (): Promise<PickList[]> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('pick_lists').select('*').order('created_at', { ascending: false });
+      if (error) throw error;
+      return data || [];
+    } else {
+      return getLocalTable<PickList>('pick_lists');
+    }
+  },
+
+  createPickList: async (orderId: string, items: PickListItem[]): Promise<PickList> => {
+    const newPl: PickList = {
+      id: `PKL-${Date.now().toString().slice(-4)}${Math.floor(Math.random() * 10)}`,
+      order_id: orderId,
+      items,
+      status: 'pending',
+      created_at: new Date().toISOString()
+    };
+    if (supabase) {
+      const { error } = await supabase.from('pick_lists').insert([newPl]);
+      if (error) throw error;
+    } else {
+      const list = getLocalTable<PickList>('pick_lists');
+      saveLocalTable('pick_lists', [newPl, ...list]);
+    }
+    return newPl;
+  },
+
+  updatePickList: async (id: string, updates: Partial<PickList>): Promise<PickList> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('pick_lists').update(updates).eq('id', id).select().single();
+      if (error) throw error;
+      return data;
+    } else {
+      const list = getLocalTable<PickList>('pick_lists');
+      const updatedList = list.map(pl => pl.id === id ? { ...pl, ...updates } : pl);
+      saveLocalTable('pick_lists', updatedList);
+      return updatedList.find(pl => pl.id === id)!;
+    }
+  },
+
+  // DISPATCHES
+  getDispatches: async (): Promise<Dispatch[]> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('dispatches').select('*').order('dispatched_at', { ascending: false });
+      if (error) throw error;
+      return data || [];
+    } else {
+      return getLocalTable<Dispatch>('dispatches');
+    }
+  },
+
+  createDispatch: async (dispatch: Omit<Dispatch, 'id' | 'dispatched_at'>): Promise<Dispatch> => {
+    const newDp: Dispatch = {
+      ...dispatch,
+      id: `DSP-${Date.now().toString().slice(-4)}${Math.floor(Math.random() * 10)}`,
+      dispatched_at: new Date().toISOString()
+    };
+    if (supabase) {
+      const { error } = await supabase.from('dispatches').insert([newDp]);
+      if (error) throw error;
+    } else {
+      const list = getLocalTable<Dispatch>('dispatches');
+      saveLocalTable('dispatches', [newDp, ...list]);
+    }
+    return newDp;
+  },
+
   wipeDatabase: async (actor: User): Promise<void> => {
     if (actor.role !== 'admin') throw new Error('Only admins can wipe the database.');
     if (supabase) {
       // Clear referencing tables first to prevent foreign key errors
       await supabase.from('stock_ledger').delete().neq('id', '_none_');
       await supabase.from('customer_ledger').delete().neq('id', '_none_');
+      await supabase.from('stock_reservation').delete().neq('id', '_none_');
+      await supabase.from('pick_lists').delete().neq('id', '_none_');
+      await supabase.from('dispatches').delete().neq('id', '_none_');
       await supabase.from('orders').delete().neq('id', '_none_');
       await supabase.from('expenses').delete().neq('id', '_none_');
       await supabase.from('audit_logs').delete().neq('id', '_none_');
+      await supabase.from('warehouse_stock').delete().neq('id', '_none_');
+      await supabase.from('warehouses').delete().neq('id', '_none_');
       await supabase.from('products').delete().neq('id', '_none_');
       await supabase.from('users').delete().neq('id', 'usr-admin');
     } else {
@@ -1275,6 +1677,9 @@ export const db = {
       const defaultWh: Warehouse[] = [{ id: 'wh-main', name: 'Main Warehouse', location: '', created_at: new Date().toISOString(), is_active: true }];
       saveLocalTable('warehouses', defaultWh);
       saveLocalTable('warehouse_stock', []);
+      saveLocalTable('stock_reservations', []);
+      saveLocalTable('pick_lists', []);
+      saveLocalTable('dispatches', []);
     }
     await logAction(actor.id, actor.name, actor.role, `Wiped Database`, `Entire database cleared by admin.`);
   }
