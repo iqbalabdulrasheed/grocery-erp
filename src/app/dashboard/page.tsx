@@ -89,6 +89,9 @@ export default function DashboardPage() {
   // Expense Form state
   const [expenseForm, setExpenseForm] = useState<Partial<Expense>>({ amount: 0, category: "Utilities", description: "" });
   const [showExpenseModal, setShowExpenseModal] = useState(false);
+  const [expenseFilterCategory, setExpenseFilterCategory] = useState('');
+  const [expenseFilterFrom, setExpenseFilterFrom] = useState('');
+  const [expenseFilterTo, setExpenseFilterTo] = useState('');
 
   // Customer Payment Form state
   const [paymentForm, setPaymentForm] = useState({ amount: 0, ref: "", notes: "", customerId: "" });
@@ -128,6 +131,7 @@ export default function DashboardPage() {
   const [orderFilterTo, setOrderFilterTo] = useState<string>('');
 
   // Accounts Ledger filters + pagination + expanded rows
+  const [accountingSubTab, setAccountingSubTab] = useState<'expenses'|'ledger'>('expenses');
   const [ledgerFilterCustomer, setLedgerFilterCustomer] = useState<string>('');
   const [ledgerFilterType, setLedgerFilterType] = useState<string>('');
   const [ledgerFilterFrom, setLedgerFilterFrom] = useState<string>('');
@@ -1142,9 +1146,7 @@ export default function DashboardPage() {
           </button>
 
            {/* B2B Customer Pricing / Catalog */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff', 'customer', 'accountant'].includes(currentUser.role) && (
-            <button
-              onClick={() => { setActiveTab("products"); setSidebarOpen(false); }}
+          {['admin', 'superowner', 'owner', 'manager', 'staff', 'customer'].includes(currentUser.role) && (
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "products" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
@@ -1157,7 +1159,7 @@ export default function DashboardPage() {
           )}
 
           {/* Stock adjustments & ledgers */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("inventory"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1172,6 +1174,7 @@ export default function DashboardPage() {
           )}
 
           {/* Orders Tracking Pipeline */}
+          {currentUser.role !== 'accountant' && (
           <button
             onClick={() => { setActiveTab("orders"); setSidebarOpen(false); }}
             className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1186,6 +1189,7 @@ export default function DashboardPage() {
               <span className="ml-auto w-2.5 h-2.5 rounded-full bg-green-500 flex-shrink-0" />
             )}
           </button>
+          )}
 
           {/* Cancelled Orders Returns */}
           {['admin', 'superowner', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
@@ -1199,7 +1203,7 @@ export default function DashboardPage() {
             >
               <Undo2 className="w-4 h-4" />
               Cancelled Returns
-              {orders.filter(o => o.status === 'failed').length > 0 && (
+              {orders.filter(o => o.status === 'failed' && !o.status_history?.some((h: any) => h.updated_by_name?.startsWith('STOCK_RESTORED:'))).length > 0 && (
                 <span className="ml-auto w-2.5 h-2.5 rounded-full bg-red-500 flex-shrink-0" />
               )}
             </button>
@@ -1221,7 +1225,7 @@ export default function DashboardPage() {
           )}
 
           {/* Users Creation RBAC */}
-          {['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("users"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1266,7 +1270,7 @@ export default function DashboardPage() {
           )}
 
           {/* Soft Deleted Trash Recovery */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("trash"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1500,7 +1504,8 @@ export default function DashboardPage() {
                       </div>
                     )}
 
-                    {/* Active Orders — visible to all non-customer roles */}
+                    {/* Active Orders — hidden from accountant */}
+                    {currentUser.role !== 'accountant' && (
                     <button
                       onClick={() => setActiveTab("orders")}
                       className="glass-card rounded-xl p-5 flex items-center justify-between w-full text-left hover:ring-2 hover:ring-amber-400/40 transition cursor-pointer"
@@ -1516,8 +1521,10 @@ export default function DashboardPage() {
                         <ShoppingBag className="w-5 h-5" />
                       </div>
                     </button>
+                    )}
 
-                    {/* Low stock count — visible to all non-customer roles */}
+                    {/* Low stock count — hidden from accountant */}
+                    {currentUser.role !== 'accountant' && (
                     <button
                       onClick={() => setActiveTab("inventory")}
                       className="glass-card rounded-xl p-5 flex items-center justify-between w-full text-left hover:ring-2 hover:ring-red-400/40 transition cursor-pointer"
@@ -1533,6 +1540,7 @@ export default function DashboardPage() {
                         <AlertTriangle className="w-5 h-5" />
                       </div>
                     </button>
+                    )}
 
                     {/* Net Profit — hidden from staff & delivery */}
                     {!isFinanciallyRestricted && (
@@ -3174,10 +3182,7 @@ export default function DashboardPage() {
                       Receive B2B Payment
                     </button>
                   )}
-                  <button onClick={() => exportToCSV(expenses, "operating_expenses_export")} className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-bold text-slate-700 dark:text-gray-300 cursor-pointer">
-                    <Download className="w-3.5 h-3.5" />
-                    Expenses CSV
-                  </button>
+
                 </div>
               </div>
 
@@ -3208,200 +3213,298 @@ export default function DashboardPage() {
                 )}
               </div>
 
-              {/* B2B CUSTOMER LEDGER SECTION */}
-              <div className="space-y-4">
-                <h3 className="text-xs font-bold text-slate-950 dark:text-white uppercase tracking-wider flex items-center gap-1.5">
-                  <Users className="w-4 h-4 text-blue-500 dark:text-blue-400" />
-                  B2B Customer Credit & Ledger Tracker
-                </h3>
 
-                {/* LEDGER FILTERS */}
-                <div className="flex flex-wrap items-end gap-3 p-4 rounded-xl bg-white dark:bg-white/3 border border-slate-200 dark:border-white/5">
-                  <div className="flex flex-col gap-1 min-w-[160px]">
-                    <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Customer</label>
-                    <select
-                      value={ledgerFilterCustomer}
-                      onChange={e => setLedgerFilterCustomer(e.target.value)}
-                      className="glass-input px-2.5 py-1.5 rounded-lg text-xs"
-                    >
-                      <option value="">All Customers</option>
-                      {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                    </select>
-                  </div>
-                  {ledgerFilterCustomer && (
-                    <button
-                      onClick={() => setLedgerFilterCustomer('')}
-                      className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-xs font-bold hover:bg-red-50 dark:hover:bg-red-950/20 transition self-end"
-                    >
-                      <X className="w-3 h-3" /> Clear
-                    </button>
-                  )}
-                  <span className="ml-auto text-[10px] text-slate-400 dark:text-gray-500 self-end pb-1.5">{filteredCustomers.length} customers</span>
+
+              {/* INNER SUB-TABS: Expenses | Customer Ledger */}
+              <div className="space-y-4">
+                {/* Sub-tab toggle */}
+                <div className="flex gap-1 p-1 bg-slate-100 dark:bg-white/5 rounded-xl w-fit border border-slate-200 dark:border-white/5">
+                  <button
+                    onClick={() => setAccountingSubTab('expenses')}
+                    className={`px-4 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${accountingSubTab === 'expenses' ? 'bg-white dark:bg-white/10 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 dark:text-gray-400 hover:text-slate-800 dark:hover:text-white'}`}
+                  >
+                    Operating Expenses
+                  </button>
+                  <button
+                    onClick={() => setAccountingSubTab('ledger')}
+                    className={`px-4 py-1.5 rounded-lg text-xs font-bold transition cursor-pointer ${accountingSubTab === 'ledger' ? 'bg-white dark:bg-white/10 text-slate-900 dark:text-white shadow-sm' : 'text-slate-500 dark:text-gray-400 hover:text-slate-800 dark:hover:text-white'}`}
+                  >
+                    B2B Customer Ledger
+                  </button>
                 </div>
 
-                {/* CUSTOMER TABLE WITH INLINE LEDGER */}
-                <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
-                  <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
-                    <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
-                      <tr>
-                        <th className="p-4">Customer Name</th>
-                        <th className="p-4">Credit Limit</th>
-                        <th className="p-4">Outstanding Balance</th>
-                        <th className="p-4">Available Credit</th>
-                        <th className="p-4 text-right">Ledger Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredCustomers.length === 0 ? (
-                        <tr><td colSpan={5} className="p-8 text-center text-slate-400 dark:text-gray-500">No customers found</td></tr>
-                      ) : filteredCustomers.map(c => {
-                        const limit = c.credit_limit || 0;
-                        const outstanding = c.outstanding_balance || 0;
-                        const available = limit - outstanding;
-                        const expanded = expandedLedgerCustomers[c.id];
-                        const isOpen = c.id in expandedLedgerCustomers;
-                        const ledgerEntries = expanded?.entries ?? [];
-                        const ledgerPage = expanded?.page ?? 1;
-                        const ledgerTotalPages = Math.max(1, Math.ceil(ledgerEntries.length / LEDGER_PAGE_SIZE));
-
-                        // Apply type + date filters to inline ledger entries
-                        const filteredLedgerEntries = ledgerEntries.filter((l: any) => {
-                          if (ledgerFilterType && l.type !== ledgerFilterType) return false;
-                          if (ledgerFilterFrom && l.timestamp.split('T')[0] < ledgerFilterFrom) return false;
-                          if (ledgerFilterTo && l.timestamp.split('T')[0] > ledgerFilterTo) return false;
-                          return true;
-                        });
-                        const pagedLedger = filteredLedgerEntries.slice((ledgerPage - 1) * LEDGER_PAGE_SIZE, ledgerPage * LEDGER_PAGE_SIZE);
-                        const ledgerFilteredPages = Math.max(1, Math.ceil(filteredLedgerEntries.length / LEDGER_PAGE_SIZE));
-
-                        return (
-                          <React.Fragment key={c.id}>
-                            <tr className={`hover:bg-slate-50 dark:hover:bg-white/2 divide-y-0 border-t border-slate-100 dark:border-white/5 ${isOpen ? 'bg-blue-50/50 dark:bg-blue-950/10' : ''}`}>
+                {/* ---- EXPENSES SUB-TAB ---- */}
+                {accountingSubTab === 'expenses' && (() => {
+                  const expenseCategories = ['Utilities','Rent','Maintenance','Salaries','Fuel/Transport','Other'];
+                  const filteredExpenses = expenses.filter((ex: any) => {
+                    if (expenseFilterCategory && ex.category !== expenseFilterCategory) return false;
+                    if (expenseFilterFrom && ex.timestamp.split('T')[0] < expenseFilterFrom) return false;
+                    if (expenseFilterTo && ex.timestamp.split('T')[0] > expenseFilterTo) return false;
+                    return true;
+                  }).sort((a: any, b: any) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+                  const filteredTotal = filteredExpenses.reduce((s: number, e: any) => s + e.amount, 0);
+                  return (
+                  <div className="space-y-4">
+                    {/* Filters */}
+                    <div className="flex flex-wrap items-end gap-3 p-4 rounded-xl bg-white dark:bg-white/3 border border-slate-200 dark:border-white/5">
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Category</label>
+                        <select value={expenseFilterCategory} onChange={e => setExpenseFilterCategory(e.target.value)} className="glass-input px-2.5 py-1.5 rounded-lg text-xs">
+                          <option value="">All Categories</option>
+                          {expenseCategories.map(c => <option key={c} value={c}>{c}</option>)}
+                        </select>
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">From</label>
+                        <input type="date" value={expenseFilterFrom} onChange={e => setExpenseFilterFrom(e.target.value)} className="glass-input px-2.5 py-1.5 rounded-lg text-xs" />
+                      </div>
+                      <div className="flex flex-col gap-1">
+                        <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">To</label>
+                        <input type="date" value={expenseFilterTo} onChange={e => setExpenseFilterTo(e.target.value)} className="glass-input px-2.5 py-1.5 rounded-lg text-xs" />
+                      </div>
+                      {(expenseFilterCategory || expenseFilterFrom || expenseFilterTo) && (
+                        <button onClick={() => { setExpenseFilterCategory(''); setExpenseFilterFrom(''); setExpenseFilterTo(''); }} className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-xs font-bold hover:bg-red-50 dark:hover:bg-red-950/20 transition self-end">
+                          <X className="w-3 h-3" /> Clear
+                        </button>
+                      )}
+                      <div className="ml-auto flex items-center gap-4 self-end pb-0.5">
+                        <span className="text-[10px] text-slate-400 dark:text-gray-500">{filteredExpenses.length} records</span>
+                        <span className="text-xs font-bold text-red-600 dark:text-red-400">Total: {formatSAR(filteredTotal)}</span>
+                        <button onClick={() => exportToCSV(filteredExpenses, 'expenses_export')} className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-bold text-slate-700 dark:text-gray-300 cursor-pointer">
+                          <Download className="w-3 h-3" /> Export
+                        </button>
+                      </div>
+                    </div>
+                    {/* Expense table */}
+                    <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
+                      <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
+                        <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
+                          <tr>
+                            <th className="p-4">Date</th>
+                            <th className="p-4">Category</th>
+                            <th className="p-4">Description</th>
+                            <th className="p-4">Recorded By</th>
+                            <th className="p-4 text-right">Amount</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {filteredExpenses.length === 0 ? (
+                            <tr><td colSpan={5} className="p-8 text-center text-slate-400 dark:text-gray-500">No expenses found</td></tr>
+                          ) : filteredExpenses.map((ex: any) => (
+                            <tr key={ex.id} className="border-t border-slate-100 dark:border-white/5 hover:bg-slate-50 dark:hover:bg-white/2">
+                              <td className="p-4 text-slate-500 dark:text-gray-400 whitespace-nowrap">{new Date(ex.timestamp).toLocaleDateString()}</td>
                               <td className="p-4">
-                                <div className="font-bold text-slate-900 dark:text-white">{c.name}</div>
-                                <span className="text-[10px] text-slate-400 dark:text-gray-500">Username: @{c.username}</span>
+                                <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-red-500/10 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20">{ex.category}</span>
                               </td>
-                              <td className="p-4 font-bold">{formatSAR(limit)}</td>
-                              <td className="p-4 font-bold text-amber-600 dark:text-amber-400">{formatSAR(outstanding)}</td>
-                              <td className="p-4 font-bold text-emerald-600 dark:text-emerald-400">{formatSAR(available)}</td>
-                              <td className="p-4 text-right">
-                                <button
-                                  onClick={() => toggleLedger(c.id, c.name)}
-                                  className={`px-3 py-1 rounded font-bold text-[10px] border transition ${isOpen ? 'bg-blue-600 text-white border-blue-600' : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border-slate-200 dark:border-white/10 text-slate-700 dark:text-gray-300'}`}
-                                >
-                                  {isOpen ? 'Hide Statements ▲' : 'View Statements ▼'}
-                                </button>
-                              </td>
+                              <td className="p-4 text-slate-700 dark:text-gray-300 max-w-xs truncate" title={ex.description}>{ex.description}</td>
+                              <td className="p-4 text-slate-500 dark:text-gray-400">{ex.user_name || '—'}</td>
+                              <td className="p-4 text-right font-bold text-red-600 dark:text-red-400">{formatSAR(ex.amount)}</td>
                             </tr>
+                          ))}
+                        </tbody>
+                        {filteredExpenses.length > 0 && (
+                          <tfoot>
+                            <tr className="border-t-2 border-slate-200 dark:border-white/10 bg-slate-50 dark:bg-white/3">
+                              <td colSpan={4} className="p-4 text-xs font-bold text-slate-700 dark:text-gray-300 uppercase tracking-wider">Total</td>
+                              <td className="p-4 text-right font-extrabold text-red-600 dark:text-red-400">{formatSAR(filteredTotal)}</td>
+                            </tr>
+                          </tfoot>
+                        )}
+                      </table>
+                    </div>
+                  </div>
+                  );
+                })()}
 
-                            {/* INLINE EXPANDED LEDGER */}
-                            {isOpen && (
-                              <tr key={`${c.id}-ledger`}>
-                                <td colSpan={5} className="p-0 border-t border-blue-100 dark:border-blue-500/10">
-                                  <div className="bg-slate-50/80 dark:bg-blue-950/5 px-6 py-4 space-y-3">
-                                    {/* Sub-filters for the ledger entries */}
-                                    <div className="flex flex-wrap items-end gap-3 pb-2 border-b border-slate-200 dark:border-white/5">
-                                      <span className="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider self-end">Ledger for {c.name}</span>
-                                      <div className="flex flex-col gap-1">
-                                        <label className="text-[10px] text-slate-400 dark:text-gray-500 uppercase">Type</label>
-                                        <select value={ledgerFilterType} onChange={e => setLedgerFilterType(e.target.value)} className="glass-input px-2 py-1 rounded text-xs">
-                                          <option value="">All</option>
-                                          <option value="order">Order</option>
-                                          <option value="payment">Payment</option>
-                                          <option value="credit_adjustment">Credit Adjustment</option>
-                                        </select>
-                                      </div>
-                                      <div className="flex flex-col gap-1">
-                                        <label className="text-[10px] text-slate-400 dark:text-gray-500 uppercase">From</label>
-                                        <input type="date" value={ledgerFilterFrom} onChange={e => setLedgerFilterFrom(e.target.value)} className="glass-input px-2 py-1 rounded text-xs" />
-                                      </div>
-                                      <div className="flex flex-col gap-1">
-                                        <label className="text-[10px] text-slate-400 dark:text-gray-500 uppercase">To</label>
-                                        <input type="date" value={ledgerFilterTo} onChange={e => setLedgerFilterTo(e.target.value)} className="glass-input px-2 py-1 rounded text-xs" />
-                                      </div>
-                                      {(ledgerFilterType || ledgerFilterFrom || ledgerFilterTo) && (
-                                        <button onClick={() => { setLedgerFilterType(''); setLedgerFilterFrom(''); setLedgerFilterTo(''); }} className="flex items-center gap-1 px-2 py-1 rounded border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-[10px] font-bold self-end">
-                                          <X className="w-3 h-3" /> Clear
-                                        </button>
-                                      )}
-                                      <span className="ml-auto text-[10px] text-slate-400 dark:text-gray-500 self-end">{filteredLedgerEntries.length} entries</span>
-                                    </div>
+                {/* ---- B2B CUSTOMER LEDGER SUB-TAB ---- */}
+                {accountingSubTab === 'ledger' && (
+                <div className="space-y-4">
+                  {/* LEDGER FILTERS */}
+                  <div className="flex flex-wrap items-end gap-3 p-4 rounded-xl bg-white dark:bg-white/3 border border-slate-200 dark:border-white/5">
+                    <div className="flex flex-col gap-1 min-w-[160px]">
+                      <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Customer</label>
+                      <select
+                        value={ledgerFilterCustomer}
+                        onChange={e => setLedgerFilterCustomer(e.target.value)}
+                        className="glass-input px-2.5 py-1.5 rounded-lg text-xs"
+                      >
+                        <option value="">All Customers</option>
+                        {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </select>
+                    </div>
+                    {ledgerFilterCustomer && (
+                      <button
+                        onClick={() => setLedgerFilterCustomer('')}
+                        className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-xs font-bold hover:bg-red-50 dark:hover:bg-red-950/20 transition self-end"
+                      >
+                        <X className="w-3 h-3" /> Clear
+                      </button>
+                    )}
+                    <span className="ml-auto text-[10px] text-slate-400 dark:text-gray-500 self-end pb-1.5">{filteredCustomers.length} customers</span>
+                  </div>
 
-                                    {expanded === null ? (
-                                      <p className="text-xs text-slate-400 dark:text-gray-500 py-2 text-center">Loading ledger…</p>
-                                    ) : filteredLedgerEntries.length === 0 ? (
-                                      <p className="text-xs text-slate-400 dark:text-gray-500 py-2 text-center">No ledger entries found</p>
-                                    ) : (
-                                      <>
-                                        <table className="w-full text-left text-[11px] text-slate-700 dark:text-gray-300">
-                                          <thead className="text-[10px] text-slate-400 dark:text-gray-500 font-bold uppercase tracking-wider">
-                                            <tr>
-                                              <th className="pb-2 pr-4">Date</th>
-                                              <th className="pb-2 pr-4">Type</th>
-                                              <th className="pb-2 pr-4">Reference</th>
-                                              <th className="pb-2 pr-4 text-right">Amount</th>
-                                              <th className="pb-2 pr-4 text-right">Balance After</th>
-                                              <th className="pb-2">Notes</th>
-                                            </tr>
-                                          </thead>
-                                          <tbody className="divide-y divide-slate-100 dark:divide-white/5">
-                                            {pagedLedger.map((l: any) => (
-                                              <tr key={l.id} className="hover:bg-slate-100/50 dark:hover:bg-white/3">
-                                                <td className="py-2 pr-4 text-slate-500 dark:text-gray-400 whitespace-nowrap">{new Date(l.timestamp).toLocaleDateString()}</td>
-                                                <td className="py-2 pr-4">
-                                                  <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${
-                                                    l.type === 'order' ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20' :
-                                                    l.type === 'payment' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/20' :
-                                                    'bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-gray-400 border border-slate-200 dark:border-white/10'
-                                                  }`}>
-                                                    {l.type}
-                                                  </span>
-                                                </td>
-                                                <td className="py-2 pr-4 font-mono text-slate-600 dark:text-gray-400">{l.ref_id || '—'}</td>
-                                                <td className={`py-2 pr-4 text-right font-bold ${l.type === 'payment' ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-900 dark:text-white'}`}>
-                                                  {l.type === 'payment' ? '−' : '+'}{formatSAR(Math.abs(l.amount))}
-                                                </td>
-                                                <td className="py-2 pr-4 text-right font-bold text-slate-900 dark:text-white">{formatSAR(l.balance_after)}</td>
-                                                <td className="py-2 text-slate-500 dark:text-gray-400 max-w-xs truncate" title={l.notes}>{l.notes || '—'}</td>
-                                              </tr>
-                                            ))}
-                                          </tbody>
-                                        </table>
+                  {/* CUSTOMER TABLE WITH INLINE LEDGER */}
+                  <div className="glass-panel rounded-xl border border-slate-200 dark:border-white/5 overflow-hidden overflow-x-auto">
+                    <table className="w-full text-left text-xs text-slate-700 dark:text-gray-300">
+                      <thead className="bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider text-[10px]">
+                        <tr>
+                          <th className="p-4">Customer Name</th>
+                          <th className="p-4">Credit Limit</th>
+                          <th className="p-4">Outstanding Balance</th>
+                          <th className="p-4">Available Credit</th>
+                          <th className="p-4 text-right">Ledger Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredCustomers.length === 0 ? (
+                          <tr><td colSpan={5} className="p-8 text-center text-slate-400 dark:text-gray-500">No customers found</td></tr>
+                        ) : filteredCustomers.map(c => {
+                          const limit = c.credit_limit || 0;
+                          const outstanding = c.outstanding_balance || 0;
+                          const available = limit - outstanding;
+                          const expanded = expandedLedgerCustomers[c.id];
+                          const isOpen = c.id in expandedLedgerCustomers;
+                          const ledgerEntries = expanded?.entries ?? [];
+                          const ledgerPage = expanded?.page ?? 1;
+                          const ledgerTotalPages = Math.max(1, Math.ceil(ledgerEntries.length / LEDGER_PAGE_SIZE));
 
-                                        {/* LEDGER PAGINATION */}
-                                        {ledgerFilteredPages > 1 && (
-                                          <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200 dark:border-white/5">
-                                            <span className="text-[10px] text-slate-400 dark:text-gray-500">
-                                              Page {ledgerPage} of {ledgerFilteredPages} · {filteredLedgerEntries.length} entries
-                                            </span>
-                                            <div className="flex items-center gap-1">
-                                              <button onClick={() => setExpandedLedgerCustomers(prev => ({ ...prev, [c.id]: { ...prev[c.id]!, page: Math.max(1, ledgerPage - 1) } }))} disabled={ledgerPage === 1} className="px-2.5 py-1 rounded text-[10px] font-bold bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-gray-400 disabled:opacity-40 cursor-pointer disabled:cursor-default">‹</button>
-                                              {Array.from({ length: Math.min(5, ledgerFilteredPages) }, (_, i) => {
-                                                const start = Math.max(1, Math.min(ledgerPage - 2, ledgerFilteredPages - 4));
-                                                const p = start + i;
-                                                if (p > ledgerFilteredPages) return null;
-                                                return <button key={p} onClick={() => setExpandedLedgerCustomers(prev => ({ ...prev, [c.id]: { ...prev[c.id]!, page: p } }))} className={`px-2.5 py-1 rounded text-[10px] font-bold border cursor-pointer ${ledgerPage === p ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white dark:bg-white/5 border-slate-200 dark:border-white/10 text-slate-600 dark:text-gray-400 hover:bg-slate-100 dark:hover:bg-white/10'}`}>{p}</button>;
-                                              })}
-                                              <button onClick={() => setExpandedLedgerCustomers(prev => ({ ...prev, [c.id]: { ...prev[c.id]!, page: Math.min(ledgerFilteredPages, ledgerPage + 1) } }))} disabled={ledgerPage === ledgerFilteredPages} className="px-2.5 py-1 rounded text-[10px] font-bold bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-gray-400 disabled:opacity-40 cursor-pointer disabled:cursor-default">›</button>
-                                            </div>
-                                          </div>
-                                        )}
-                                      </>
-                                    )}
-                                  </div>
+                          // Apply type + date filters to inline ledger entries
+                          const filteredLedgerEntries = ledgerEntries.filter((l: any) => {
+                            if (ledgerFilterType && l.type !== ledgerFilterType) return false;
+                            if (ledgerFilterFrom && l.timestamp.split('T')[0] < ledgerFilterFrom) return false;
+                            if (ledgerFilterTo && l.timestamp.split('T')[0] > ledgerFilterTo) return false;
+                            return true;
+                          });
+                          const pagedLedger = filteredLedgerEntries.slice((ledgerPage - 1) * LEDGER_PAGE_SIZE, ledgerPage * LEDGER_PAGE_SIZE);
+                          const ledgerFilteredPages = Math.max(1, Math.ceil(filteredLedgerEntries.length / LEDGER_PAGE_SIZE));
+
+                          return (
+                            <React.Fragment key={c.id}>
+                              <tr className={`hover:bg-slate-50 dark:hover:bg-white/2 divide-y-0 border-t border-slate-100 dark:border-white/5 ${isOpen ? 'bg-blue-50/50 dark:bg-blue-950/10' : ''}`}>
+                                <td className="p-4">
+                                  <div className="font-bold text-slate-900 dark:text-white">{c.name}</div>
+                                  <span className="text-[10px] text-slate-400 dark:text-gray-500">Username: @{c.username}</span>
+                                </td>
+                                <td className="p-4 font-bold">{formatSAR(limit)}</td>
+                                <td className="p-4 font-bold text-amber-600 dark:text-amber-400">{formatSAR(outstanding)}</td>
+                                <td className="p-4 font-bold text-emerald-600 dark:text-emerald-400">{formatSAR(available)}</td>
+                                <td className="p-4 text-right">
+                                  <button
+                                    onClick={() => toggleLedger(c.id, c.name)}
+                                    className={`px-3 py-1 rounded font-bold text-[10px] border transition ${isOpen ? 'bg-blue-600 text-white border-blue-600' : 'bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border-slate-200 dark:border-white/10 text-slate-700 dark:text-gray-300'}`}
+                                  >
+                                    {isOpen ? 'Hide Statements ▲' : 'View Statements ▼'}
+                                  </button>
                                 </td>
                               </tr>
-                            )}
-                          </React.Fragment>
-                        );
-                      })}
-                    </tbody>
-                  </table>
+
+                              {/* INLINE EXPANDED LEDGER */}
+                              {isOpen && (
+                                <tr key={`${c.id}-ledger`}>
+                                  <td colSpan={5} className="p-0 border-t border-blue-100 dark:border-blue-500/10">
+                                    <div className="bg-slate-50/80 dark:bg-blue-950/5 px-6 py-4 space-y-3">
+                                      {/* Sub-filters for the ledger entries */}
+                                      <div className="flex flex-wrap items-end gap-3 pb-2 border-b border-slate-200 dark:border-white/5">
+                                        <span className="text-[10px] font-bold text-blue-600 dark:text-blue-400 uppercase tracking-wider self-end">Ledger for {c.name}</span>
+                                        <div className="flex flex-col gap-1">
+                                          <label className="text-[10px] text-slate-400 dark:text-gray-500 uppercase">Type</label>
+                                          <select value={ledgerFilterType} onChange={e => setLedgerFilterType(e.target.value)} className="glass-input px-2 py-1 rounded text-xs">
+                                            <option value="">All</option>
+                                            <option value="order">Order</option>
+                                            <option value="payment">Payment</option>
+                                            <option value="credit_adjustment">Credit Adjustment</option>
+                                          </select>
+                                        </div>
+                                        <div className="flex flex-col gap-1">
+                                          <label className="text-[10px] text-slate-400 dark:text-gray-500 uppercase">From</label>
+                                          <input type="date" value={ledgerFilterFrom} onChange={e => setLedgerFilterFrom(e.target.value)} className="glass-input px-2 py-1 rounded text-xs" />
+                                        </div>
+                                        <div className="flex flex-col gap-1">
+                                          <label className="text-[10px] text-slate-400 dark:text-gray-500 uppercase">To</label>
+                                          <input type="date" value={ledgerFilterTo} onChange={e => setLedgerFilterTo(e.target.value)} className="glass-input px-2 py-1 rounded text-xs" />
+                                        </div>
+                                        {(ledgerFilterType || ledgerFilterFrom || ledgerFilterTo) && (
+                                          <button onClick={() => { setLedgerFilterType(''); setLedgerFilterFrom(''); setLedgerFilterTo(''); }} className="flex items-center gap-1 px-2 py-1 rounded border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-[10px] font-bold self-end">
+                                            <X className="w-3 h-3" /> Clear
+                                          </button>
+                                        )}
+                                        <span className="ml-auto text-[10px] text-slate-400 dark:text-gray-500 self-end">{filteredLedgerEntries.length} entries</span>
+                                      </div>
+
+                                      {expanded === null ? (
+                                        <p className="text-xs text-slate-400 dark:text-gray-500 py-2 text-center">Loading ledger…</p>
+                                      ) : filteredLedgerEntries.length === 0 ? (
+                                        <p className="text-xs text-slate-400 dark:text-gray-500 py-2 text-center">No ledger entries found</p>
+                                      ) : (
+                                        <>
+                                          <table className="w-full text-left text-[11px] text-slate-700 dark:text-gray-300">
+                                            <thead className="text-[10px] text-slate-400 dark:text-gray-500 font-bold uppercase tracking-wider">
+                                              <tr>
+                                                <th className="pb-2 pr-4">Date</th>
+                                                <th className="pb-2 pr-4">Type</th>
+                                                <th className="pb-2 pr-4">Reference</th>
+                                                <th className="pb-2 pr-4 text-right">Amount</th>
+                                                <th className="pb-2 pr-4 text-right">Balance After</th>
+                                                <th className="pb-2">Notes</th>
+                                              </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-slate-100 dark:divide-white/5">
+                                              {pagedLedger.map((l: any) => (
+                                                <tr key={l.id} className="hover:bg-slate-100/50 dark:hover:bg-white/3">
+                                                  <td className="py-2 pr-4 text-slate-500 dark:text-gray-400 whitespace-nowrap">{new Date(l.timestamp).toLocaleDateString()}</td>
+                                                  <td className="py-2 pr-4">
+                                                    <span className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${
+                                                      l.type === 'order' ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20' :
+                                                      l.type === 'payment' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/20' :
+                                                      'bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-gray-400 border border-slate-200 dark:border-white/10'
+                                                    }`}>
+                                                      {l.type}
+                                                    </span>
+                                                  </td>
+                                                  <td className="py-2 pr-4 font-mono text-slate-600 dark:text-gray-400">{l.ref_id || '—'}</td>
+                                                  <td className={`py-2 pr-4 text-right font-bold ${l.type === 'payment' ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-900 dark:text-white'}`}>
+                                                    {l.type === 'payment' ? '−' : '+'}{formatSAR(Math.abs(l.amount))}
+                                                  </td>
+                                                  <td className="py-2 pr-4 text-right font-bold text-slate-900 dark:text-white">{formatSAR(l.balance_after)}</td>
+                                                  <td className="py-2 text-slate-500 dark:text-gray-400 max-w-xs truncate" title={l.notes}>{l.notes || '—'}</td>
+                                                </tr>
+                                              ))}
+                                            </tbody>
+                                          </table>
+
+                                          {/* LEDGER PAGINATION */}
+                                          {ledgerFilteredPages > 1 && (
+                                            <div className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200 dark:border-white/5">
+                                              <span className="text-[10px] text-slate-400 dark:text-gray-500">
+                                                Page {ledgerPage} of {ledgerFilteredPages} · {filteredLedgerEntries.length} entries
+                                              </span>
+                                              <div className="flex items-center gap-1">
+                                                <button onClick={() => setExpandedLedgerCustomers(prev => ({ ...prev, [c.id]: { ...prev[c.id]!, page: Math.max(1, ledgerPage - 1) } }))} disabled={ledgerPage === 1} className="px-2.5 py-1 rounded text-[10px] font-bold bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-gray-400 disabled:opacity-40 cursor-pointer disabled:cursor-default">‹</button>
+                                                {Array.from({ length: Math.min(5, ledgerFilteredPages) }, (_, i) => {
+                                                  const start = Math.max(1, Math.min(ledgerPage - 2, ledgerFilteredPages - 4));
+                                                  const p = start + i;
+                                                  if (p > ledgerFilteredPages) return null;
+                                                  return <button key={p} onClick={() => setExpandedLedgerCustomers(prev => ({ ...prev, [c.id]: { ...prev[c.id]!, page: p } }))} className={`px-2.5 py-1 rounded text-[10px] font-bold border cursor-pointer ${ledgerPage === p ? 'bg-blue-600 border-blue-600 text-white' : 'bg-white dark:bg-white/5 border-slate-200 dark:border-white/10 text-slate-600 dark:text-gray-400 hover:bg-slate-100 dark:hover:bg-white/10'}`}>{p}</button>;
+                                                })}
+                                                <button onClick={() => setExpandedLedgerCustomers(prev => ({ ...prev, [c.id]: { ...prev[c.id]!, page: Math.min(ledgerFilteredPages, ledgerPage + 1) } }))} disabled={ledgerPage === ledgerFilteredPages} className="px-2.5 py-1 rounded text-[10px] font-bold bg-white dark:bg-white/5 border border-slate-200 dark:border-white/10 text-slate-600 dark:text-gray-400 disabled:opacity-40 cursor-pointer disabled:cursor-default">›</button>
+                                              </div>
+                                            </div>
+                                          )}
+                                        </>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                            </React.Fragment>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
                 </div>
+                )}
               </div>
-            </div>
-            );
-          })()}
 
           {/* TAB 7: USER MANAGEMENT */}
           {activeTab === "users" && ['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser.role) && (
@@ -4044,12 +4147,161 @@ export default function DashboardPage() {
                         onChange={(e) => setProductForm({ ...productForm, category: e.target.value })}
                         className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
                       >
-                        <option value="Dry Food">Dry Food</option>
-                        <option value="Dairy">Dairy</option>
-                        <option value="Beverages">Beverages</option>
-                        <option value="Rice & Grains">Rice & Grains</option>
-                        <option value="Oils & Fats">Oils & Fats</option>
-                        <option value="Canned Goods">Canned Goods</option>
+                        <optgroup label="🥩 Fresh &amp; Perishables">
+                          <option value="Fresh Meat &amp; Poultry">Fresh Meat &amp; Poultry</option>
+                          <option value="Fresh Seafood">Fresh Seafood</option>
+                          <option value="Fresh Fruits">Fresh Fruits</option>
+                          <option value="Fresh Vegetables">Fresh Vegetables</option>
+                          <option value="Fresh Herbs &amp; Spices">Fresh Herbs &amp; Spices</option>
+                          <option value="Deli &amp; Charcuterie">Deli &amp; Charcuterie</option>
+                          <option value="Bakery &amp; Fresh Bread">Bakery &amp; Fresh Bread</option>
+                          <option value="Flowers &amp; Plants">Flowers &amp; Plants</option>
+                        </optgroup>
+                        <optgroup label="🧀 Dairy, Eggs &amp; Chilled">
+                          <option value="Milk &amp; Dairy">Milk &amp; Dairy</option>
+                          <option value="Cheese">Cheese</option>
+                          <option value="Yogurt &amp; Cream">Yogurt &amp; Cream</option>
+                          <option value="Butter &amp; Margarine">Butter &amp; Margarine</option>
+                          <option value="Eggs">Eggs</option>
+                          <option value="Chilled Juices &amp; Drinks">Chilled Juices &amp; Drinks</option>
+                          <option value="Chilled Ready Meals">Chilled Ready Meals</option>
+                        </optgroup>
+                        <optgroup label="🍞 Dry Food &amp; Pantry">
+                          <option value="Rice &amp; Grains">Rice &amp; Grains</option>
+                          <option value="Pasta &amp; Noodles">Pasta &amp; Noodles</option>
+                          <option value="Flour &amp; Baking">Flour &amp; Baking</option>
+                          <option value="Bread &amp; Cereals">Bread &amp; Cereals</option>
+                          <option value="Breakfast Cereals &amp; Oats">Breakfast Cereals &amp; Oats</option>
+                          <option value="Dry Legumes &amp; Pulses">Dry Legumes &amp; Pulses</option>
+                          <option value="Nuts &amp; Dried Fruits">Nuts &amp; Dried Fruits</option>
+                          <option value="Sugar, Salt &amp; Condiments">Sugar, Salt &amp; Condiments</option>
+                        </optgroup>
+                        <optgroup label="🥫 Canned, Jarred &amp; Preserved">
+                          <option value="Canned Vegetables">Canned Vegetables</option>
+                          <option value="Canned Fruits">Canned Fruits</option>
+                          <option value="Canned Fish &amp; Seafood">Canned Fish &amp; Seafood</option>
+                          <option value="Canned Meat">Canned Meat</option>
+                          <option value="Canned Beans &amp; Lentils">Canned Beans &amp; Lentils</option>
+                          <option value="Jams, Honey &amp; Spreads">Jams, Honey &amp; Spreads</option>
+                          <option value="Pickles &amp; Olives">Pickles &amp; Olives</option>
+                          <option value="Sauces &amp; Pastes">Sauces &amp; Pastes</option>
+                          <option value="Soups &amp; Broths">Soups &amp; Broths</option>
+                        </optgroup>
+                        <optgroup label="🛢️ Oils, Fats &amp; Vinegar">
+                          <option value="Cooking Oils">Cooking Oils</option>
+                          <option value="Olive Oil">Olive Oil</option>
+                          <option value="Ghee &amp; Clarified Butter">Ghee &amp; Clarified Butter</option>
+                          <option value="Vinegar &amp; Dressings">Vinegar &amp; Dressings</option>
+                        </optgroup>
+                        <optgroup label="🧂 Spices, Herbs &amp; Seasonings">
+                          <option value="Whole Spices">Whole Spices</option>
+                          <option value="Ground Spices">Ground Spices</option>
+                          <option value="Spice Blends &amp; Mixes">Spice Blends &amp; Mixes</option>
+                          <option value="Dried Herbs">Dried Herbs</option>
+                          <option value="Curry Powders &amp; Pastes">Curry Powders &amp; Pastes</option>
+                          <option value="Food Coloring &amp; Flavoring">Food Coloring &amp; Flavoring</option>
+                        </optgroup>
+                        <optgroup label="🥤 Beverages">
+                          <option value="Water &amp; Sparkling Water">Water &amp; Sparkling Water</option>
+                          <option value="Soft Drinks &amp; Carbonated">Soft Drinks &amp; Carbonated</option>
+                          <option value="Juices &amp; Nectars">Juices &amp; Nectars</option>
+                          <option value="Energy &amp; Sports Drinks">Energy &amp; Sports Drinks</option>
+                          <option value="Tea &amp; Herbal Infusions">Tea &amp; Herbal Infusions</option>
+                          <option value="Coffee &amp; Hot Drinks">Coffee &amp; Hot Drinks</option>
+                          <option value="Milk Drinks &amp; Plant-Based">Milk Drinks &amp; Plant-Based</option>
+                          <option value="Syrups &amp; Cordials">Syrups &amp; Cordials</option>
+                        </optgroup>
+                        <optgroup label="🍫 Snacks, Sweets &amp; Confectionery">
+                          <option value="Chocolates &amp; Candy">Chocolates &amp; Candy</option>
+                          <option value="Chips &amp; Crisps">Chips &amp; Crisps</option>
+                          <option value="Biscuits &amp; Cookies">Biscuits &amp; Cookies</option>
+                          <option value="Crackers &amp; Rice Cakes">Crackers &amp; Rice Cakes</option>
+                          <option value="Popcorn &amp; Pretzels">Popcorn &amp; Pretzels</option>
+                          <option value="Gum &amp; Mints">Gum &amp; Mints</option>
+                          <option value="Ice Cream &amp; Frozen Desserts">Ice Cream &amp; Frozen Desserts</option>
+                          <option value="Cakes &amp; Pastries">Cakes &amp; Pastries</option>
+                        </optgroup>
+                        <optgroup label="❄️ Frozen Foods">
+                          <option value="Frozen Meat &amp; Poultry">Frozen Meat &amp; Poultry</option>
+                          <option value="Frozen Seafood">Frozen Seafood</option>
+                          <option value="Frozen Vegetables">Frozen Vegetables</option>
+                          <option value="Frozen Fruits">Frozen Fruits</option>
+                          <option value="Frozen Meals &amp; Snacks">Frozen Meals &amp; Snacks</option>
+                          <option value="Frozen Pizza &amp; Breads">Frozen Pizza &amp; Breads</option>
+                        </optgroup>
+                        <optgroup label="🍼 Baby &amp; Infant">
+                          <option value="Baby Formula &amp; Milk">Baby Formula &amp; Milk</option>
+                          <option value="Baby Food &amp; Purees">Baby Food &amp; Purees</option>
+                          <option value="Baby Snacks &amp; Cereals">Baby Snacks &amp; Cereals</option>
+                          <option value="Diapers &amp; Wipes">Diapers &amp; Wipes</option>
+                          <option value="Baby Toiletries">Baby Toiletries</option>
+                          <option value="Baby Accessories">Baby Accessories</option>
+                        </optgroup>
+                        <optgroup label="🧴 Health, Beauty &amp; Personal Care">
+                          <option value="Shampoo &amp; Conditioner">Shampoo &amp; Conditioner</option>
+                          <option value="Soaps &amp; Body Wash">Soaps &amp; Body Wash</option>
+                          <option value="Skincare &amp; Moisturizers">Skincare &amp; Moisturizers</option>
+                          <option value="Oral Care">Oral Care</option>
+                          <option value="Deodorants &amp; Antiperspirants">Deodorants &amp; Antiperspirants</option>
+                          <option value="Hair Care &amp; Styling">Hair Care &amp; Styling</option>
+                          <option value="Feminine Hygiene">Feminine Hygiene</option>
+                          <option value="Vitamins &amp; Supplements">Vitamins &amp; Supplements</option>
+                          <option value="OTC Medicine &amp; First Aid">OTC Medicine &amp; First Aid</option>
+                          <option value="Cosmetics &amp; Makeup">Cosmetics &amp; Makeup</option>
+                          <option value="Fragrances &amp; Perfumes">Fragrances &amp; Perfumes</option>
+                        </optgroup>
+                        <optgroup label="🧹 Household &amp; Cleaning">
+                          <option value="Laundry Detergents">Laundry Detergents</option>
+                          <option value="Fabric Softeners">Fabric Softeners</option>
+                          <option value="Dish Soap &amp; Dishwasher">Dish Soap &amp; Dishwasher</option>
+                          <option value="Floor &amp; Surface Cleaners">Floor &amp; Surface Cleaners</option>
+                          <option value="Bathroom Cleaners">Bathroom Cleaners</option>
+                          <option value="Trash Bags &amp; Liners">Trash Bags &amp; Liners</option>
+                          <option value="Paper Towels &amp; Tissues">Paper Towels &amp; Tissues</option>
+                          <option value="Toilet Paper">Toilet Paper</option>
+                          <option value="Insecticides &amp; Pest Control">Insecticides &amp; Pest Control</option>
+                          <option value="Air Fresheners">Air Fresheners</option>
+                          <option value="Mops, Brooms &amp; Brushes">Mops, Brooms &amp; Brushes</option>
+                        </optgroup>
+                        <optgroup label="🍽️ Kitchen &amp; Dining">
+                          <option value="Cookware &amp; Bakeware">Cookware &amp; Bakeware</option>
+                          <option value="Cutlery &amp; Utensils">Cutlery &amp; Utensils</option>
+                          <option value="Plates, Bowls &amp; Glasses">Plates, Bowls &amp; Glasses</option>
+                          <option value="Food Storage &amp; Containers">Food Storage &amp; Containers</option>
+                          <option value="Foil, Wrap &amp; Bags">Foil, Wrap &amp; Bags</option>
+                          <option value="Small Kitchen Appliances">Small Kitchen Appliances</option>
+                        </optgroup>
+                        <optgroup label="🏠 Home &amp; Lifestyle">
+                          <option value="Candles &amp; Home Fragrance">Candles &amp; Home Fragrance</option>
+                          <option value="Bedding &amp; Pillows">Bedding &amp; Pillows</option>
+                          <option value="Towels &amp; Bath Linen">Towels &amp; Bath Linen</option>
+                          <option value="Storage &amp; Organization">Storage &amp; Organization</option>
+                          <option value="Stationery &amp; Office">Stationery &amp; Office</option>
+                          <option value="Batteries &amp; Electricals">Batteries &amp; Electricals</option>
+                          <option value="Light Bulbs &amp; Fixtures">Light Bulbs &amp; Fixtures</option>
+                        </optgroup>
+                        <optgroup label="🐾 Pet Supplies">
+                          <option value="Pet Food - Dry">Pet Food - Dry</option>
+                          <option value="Pet Food - Wet">Pet Food - Wet</option>
+                          <option value="Pet Treats &amp; Snacks">Pet Treats &amp; Snacks</option>
+                          <option value="Pet Grooming">Pet Grooming</option>
+                          <option value="Pet Accessories">Pet Accessories</option>
+                        </optgroup>
+                        <optgroup label="🌿 Organic &amp; Specialty">
+                          <option value="Organic &amp; Natural Foods">Organic &amp; Natural Foods</option>
+                          <option value="Gluten-Free Products">Gluten-Free Products</option>
+                          <option value="Vegan &amp; Plant-Based">Vegan &amp; Plant-Based</option>
+                          <option value="Halal Certified">Halal Certified</option>
+                          <option value="Diabetic &amp; Low-Sugar">Diabetic &amp; Low-Sugar</option>
+                          <option value="Keto &amp; Low-Carb">Keto &amp; Low-Carb</option>
+                          <option value="International &amp; Ethnic Foods">International &amp; Ethnic Foods</option>
+                        </optgroup>
+                        <optgroup label="🎉 Seasonal &amp; Other">
+                          <option value="Seasonal &amp; Festive">Seasonal &amp; Festive</option>
+                          <option value="Gift Sets &amp; Hampers">Gift Sets &amp; Hampers</option>
+                          <option value="Sports &amp; Nutrition">Sports &amp; Nutrition</option>
+                          <option value="Other">Other</option>
+                        </optgroup>
                       </select>
                     </div>
                     <div>
