@@ -1147,6 +1147,8 @@ export default function DashboardPage() {
 
            {/* B2B Customer Pricing / Catalog */}
           {['admin', 'superowner', 'owner', 'manager', 'staff', 'customer'].includes(currentUser.role) && (
+            <button
+              onClick={() => { setActiveTab("products"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
                 activeTab === "products" 
                   ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20" 
