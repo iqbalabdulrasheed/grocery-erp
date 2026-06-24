@@ -3507,6 +3507,9 @@ export default function DashboardPage() {
                 </div>
                 )}
               </div>
+            </div>
+            );
+          })()}
 
           {/* TAB 7: USER MANAGEMENT */}
           {activeTab === "users" && ['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser.role) && (
