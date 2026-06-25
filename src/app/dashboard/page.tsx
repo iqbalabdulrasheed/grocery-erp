@@ -3241,9 +3241,9 @@ export default function DashboardPage() {
                   const filteredExpenses = expenses
                     .filter((ex: any) => {
                       if (expenseFilterCategory && ex.category !== expenseFilterCategory) return false;
-                      const exDate = (ex.timestamp || '').split('T')[0];
-                      if (expenseFilterFrom && exDate < expenseFilterFrom) return false;
-                      if (expenseFilterTo && exDate > expenseFilterTo) return false;
+                      const exLocal = ex.timestamp ? (() => { const d = new Date(ex.timestamp); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })() : '';
+                      if (expenseFilterFrom && exLocal < expenseFilterFrom) return false;
+                      if (expenseFilterTo && exLocal > expenseFilterTo) return false;
                       return true;
                     })
                     .slice()
@@ -3377,8 +3377,9 @@ export default function DashboardPage() {
                           // Apply type + date filters to inline ledger entries
                           const filteredLedgerEntries = ledgerEntries.filter((l: any) => {
                             if (ledgerFilterType && l.type !== ledgerFilterType) return false;
-                            if (ledgerFilterFrom && l.timestamp.split('T')[0] < ledgerFilterFrom) return false;
-                            if (ledgerFilterTo && l.timestamp.split('T')[0] > ledgerFilterTo) return false;
+                            const lLocal = l.timestamp ? (() => { const d = new Date(l.timestamp); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; })() : '';
+                            if (ledgerFilterFrom && lLocal < ledgerFilterFrom) return false;
+                            if (ledgerFilterTo && lLocal > ledgerFilterTo) return false;
                             return true;
                           });
                           const pagedLedger = filteredLedgerEntries.slice((ledgerPage - 1) * LEDGER_PAGE_SIZE, ledgerPage * LEDGER_PAGE_SIZE);
