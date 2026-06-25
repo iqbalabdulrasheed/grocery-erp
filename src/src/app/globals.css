@@ -1,6 +1,6 @@
-@import "tailwindcss";
-
-@custom-variant dark (&:where(.dark, .dark *));
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 :root {
   --background: #0b0f19;
