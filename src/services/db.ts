@@ -1163,6 +1163,52 @@ export const db = {
     return updated;
   },
 
+  removeItemFromOrder: async (orderId: string, productId: string, actor: User): Promise<Order> => {
+    const order = await db.getOrderById(orderId);
+    if (!order) throw new Error('Order not found');
+
+    const removedItem = order.items.find(i => i.product_id === productId);
+    if (!removedItem) throw new Error('Item not found in order');
+
+    const updatedItems = order.items.filter(i => i.product_id !== productId);
+    if (updatedItems.length === 0) throw new Error('Cannot remove the last item from an order');
+
+    const newSubtotal = updatedItems.reduce((sum, i) => sum + i.total_price, 0);
+    const discountAmount = order.subtotal > 0 ? (order.subtotal - order.total_amount) : 0;
+    const newTotal = Math.max(0, newSubtotal - discountAmount);
+
+    const updated: Order = {
+      ...order,
+      items: updatedItems,
+      subtotal: newSubtotal,
+      total_amount: newTotal,
+      status_history: [
+        ...order.status_history,
+        {
+          status: order.status,
+          updated_at: new Date().toISOString(),
+          updated_by_name: actor.name,
+          notes: `Item removed (out of stock): "${removedItem.name}" ×${removedItem.qty} — customer verbally confirmed order without this item`
+        }
+      ]
+    };
+
+    if (supabase) {
+      await supabase.from('orders').update(updated).eq('id', orderId);
+    } else {
+      const orders = getLocalTable<Order>('orders');
+      saveLocalTable('orders', orders.map(o => o.id === orderId ? updated : o));
+    }
+
+    await logAction(
+      actor.id, actor.name, actor.role,
+      `Removed item from Order ${orderId}`,
+      `Product: ${removedItem.name} ×${removedItem.qty} — customer approved order without this item`
+    );
+
+    return updated;
+  },
+
   updateOrderWarehouse: async (orderId: string, warehouseId: string, warehouseName: string, actor: User): Promise<void> => {
     if (supabase) {
       await supabase.from('orders').update({ warehouse_id: warehouseId, warehouse_name: warehouseName }).eq('id', orderId);
