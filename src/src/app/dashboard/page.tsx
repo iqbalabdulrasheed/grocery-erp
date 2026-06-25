@@ -2460,28 +2460,6 @@ export default function DashboardPage() {
                                         </span>
                                       )}
 
-                                      {/* Remove item after customer confirms over phone */}
-                                      {noStock && order.status === 'created' && order.items.length > 1 && (
-                                        <button
-                                          onClick={async () => {
-                                            const ok = window.confirm(
-                                              `Remove "${ic.name}" from this order?\n\nOnly do this after the customer has confirmed they are OK to receive the order without this item.`
-                                            );
-                                            if (!ok) return;
-                                            try {
-                                              await db.removeItemFromOrder(order.id, ic.product_id, currentUser);
-                                              await reloadOrdersAndStock();
-                                            } catch (e: any) {
-                                              alert('Error: ' + e.message);
-                                            }
-                                          }}
-                                          className="text-[10px] px-2 py-0.5 rounded bg-red-600 hover:bg-red-500 text-white font-bold border border-red-700 cursor-pointer transition"
-                                          title="Customer confirmed they accept the order without this item"
-                                        >
-                                          ✕ Remove — Customer OK'd
-                                        </button>
-                                      )}
-
                                       {/* Combined stock: user must enter how many to take from each warehouse */}
                                       {needsSplitInput && (
                                         <div className="w-full space-y-1.5 p-2 rounded bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-500/20">
