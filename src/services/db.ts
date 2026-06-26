@@ -97,6 +97,7 @@ export interface Order {
   cod_collected?: boolean;
   is_deleted?: boolean;
   deleted_at?: string | null;
+  removed_items?: OrderItem[];
   status_history: {
     status: Order['status'];
     updated_at: string;
@@ -104,6 +105,52 @@ export interface Order {
     notes?: string;
   }[];
 }
+
+export class OutOfStockError extends Error {
+  availableItems: any[];
+  outOfStockItems: any[];
+  constructor(message: string, availableItems: any[], outOfStockItems: any[]) {
+    super(message);
+    this.name = 'OutOfStockError';
+    this.availableItems = availableItems;
+    this.outOfStockItems = outOfStockItems;
+  }
+}
+
+export interface CompanySettings {
+  id: string;
+  name: string;
+  address: string;
+  city: string;
+  postal_code: string;
+  country: string;
+  phone: string;
+  email: string;
+  website: string;
+  vat_number: string;
+  cr_number: string;
+  zakat_number?: string;
+  business_license_number?: string;
+  logo_url?: string;
+  stamp_url?: string;
+  updated_at?: string;
+}
+
+export interface CustomerCompanyDetails {
+  customer_id: string;
+  company_name: string;
+  contact_person: string;
+  address: string;
+  city: string;
+  country: string;
+  postal_code: string;
+  vat_number: string;
+  cr_number: string;
+  phone: string;
+  email: string;
+  updated_at?: string;
+}
+
 
 export interface CustomerLedgerEntry {
   id: string;
@@ -193,6 +240,24 @@ const defaultCustomerLedger: CustomerLedgerEntry[] = [];
 
 const defaultExpenses: Expense[] = [];
 
+export const defaultCompanySettings: CompanySettings = {
+  id: 'owner-company',
+  name: 'Zenvora Grocery Distribution Ltd',
+  address: '4259 King Abdulaziz Road',
+  city: 'Riyadh',
+  postal_code: '12211',
+  country: 'Saudi Arabia',
+  phone: '+966 11 456 7890',
+  email: 'finance@zenvora.com',
+  website: 'www.zenvora.com',
+  vat_number: '310123456700003',
+  cr_number: '1010987654',
+  zakat_number: '3101234567',
+  business_license_number: 'LIC-2026-8890',
+  logo_url: '',
+  stamp_url: ''
+};
+
 // Helper to initialize local storage
 const initializeLocalStorage = () => {
   if (!isClient) return;
@@ -210,7 +275,17 @@ const initializeLocalStorage = () => {
     localStorage.setItem('stock_reservations', JSON.stringify([]));
     localStorage.setItem('pick_lists', JSON.stringify([]));
     localStorage.setItem('dispatches', JSON.stringify([]));
+    localStorage.setItem('company_settings', JSON.stringify([defaultCompanySettings]));
+    localStorage.setItem('customer_companies', JSON.stringify([]));
     localStorage.setItem('erp_initialized_v6', 'true');
+  } else {
+    // Ensure company_settings and customer_companies are initialized even if initialized_v6 was set earlier
+    if (!localStorage.getItem('company_settings')) {
+      localStorage.setItem('company_settings', JSON.stringify([defaultCompanySettings]));
+    }
+    if (!localStorage.getItem('customer_companies')) {
+      localStorage.setItem('customer_companies', JSON.stringify([]));
+    }
   }
 };
 
@@ -246,6 +321,16 @@ const checkAndSeedSupabase = async () => {
         await supabase.from('users').upsert(adminUser);
       }
     }
+
+    // Seed default company settings if missing
+    try {
+      const { count: cCount } = await supabase.from('company_settings').select('*', { count: 'exact', head: true });
+      if (cCount === 0) {
+        await supabase.from('company_settings').insert([defaultCompanySettings]);
+      }
+    } catch (e) {
+      // Table may not exist yet
+    }
   } catch (err) {
     console.error("Failed to seed Supabase database automatically:", err);
   }
@@ -256,6 +341,7 @@ if (isClient) {
   initializeLocalStorage();
   checkAndSeedSupabase();
 }
+
 
 // AUDIT LOG HELPER
 export const logAction = async (
@@ -909,6 +995,85 @@ export const db = {
     const order = await db.getOrderById(orderId);
     if (!order) throw new Error('Order not found');
 
+    // SECURE ORDER APPROVAL TRANSACTION (STOCK VALIDATION FIRST)
+    if (order.status === 'created' && newStatus === 'approved') {
+      if (supabase) {
+        try {
+          const { data, error } = await supabase.rpc('approve_order_secure', {
+            p_order_id: orderId,
+            p_actor_id: actor.id,
+            p_actor_name: actor.name,
+            p_actor_role: actor.role
+          });
+
+          if (error) throw error;
+
+          if (data && !data.success) {
+            if (data.error === 'OUT_OF_STOCK') {
+              throw new OutOfStockError(
+                "Some products are out of stock.",
+                data.available_items || [],
+                data.out_of_stock_items || []
+              );
+            }
+            throw new Error(data.error || "Order approval failed");
+          }
+
+          const updatedFromDb = await db.getOrderById(orderId);
+          if (updatedFromDb) return updatedFromDb;
+        } catch (err) {
+          if (err instanceof OutOfStockError) throw err;
+          console.warn("Secure approval RPC failed or missing, falling back to client-side validation:", err);
+        }
+      }
+
+      // Client-side/LocalStorage Stock Validation
+      const warehouseStock = await db.getWarehouseStock();
+      const availableItems: OrderItem[] = [];
+      const outOfStockItems: OrderItem[] = [];
+
+      for (const item of order.items) {
+        const splitWh = (item as any).split_warehouses;
+        let isAvailable = true;
+
+        if (splitWh && splitWh.length > 1) {
+          for (const portion of splitWh) {
+            const wsRow = warehouseStock.find(ws => ws.warehouse_id === portion.warehouse_id && ws.product_id === item.product_id);
+            const stockQty = wsRow ? wsRow.qty : 0;
+            if (stockQty < portion.qty) {
+              isAvailable = false;
+            }
+          }
+        } else {
+          const finalWhId = (item as any).warehouse_id || order.warehouse_id;
+          let stockQty: number;
+          if (finalWhId) {
+            // Specific warehouse assigned — check only that warehouse
+            const wsRow = warehouseStock.find(ws => ws.warehouse_id === finalWhId && ws.product_id === item.product_id);
+            stockQty = wsRow ? wsRow.qty : 0;
+          } else {
+            // No warehouse assigned (e.g. customer orders) — sum across ALL warehouses
+            stockQty = warehouseStock
+              .filter(ws => ws.product_id === item.product_id)
+              .reduce((sum, ws) => sum + ws.qty, 0);
+          }
+          if (stockQty < item.qty) {
+            isAvailable = false;
+          }
+        }
+
+        if (isAvailable) {
+          availableItems.push(item);
+        } else {
+          outOfStockItems.push(item);
+        }
+      }
+
+      if (outOfStockItems.length > 0) {
+        throw new OutOfStockError("Some products are out of stock.", availableItems, outOfStockItems);
+      }
+    }
+
     const historyEntry: any = { status: newStatus, updated_at: new Date().toISOString(), updated_by_name: actor.name };
     if (meta?.cancelReason) historyEntry.notes = meta.cancelReason;
 
@@ -972,9 +1137,15 @@ export const db = {
             picked_qty: 0
           });
         } else {
-          // SINGLE warehouse
-          const finalWhId = (item as any).warehouse_id || order.warehouse_id || 'wh-main';
-          const finalWhName = (item as any).warehouse_name || order.warehouse_name || 'Main Warehouse';
+          // SINGLE warehouse — if no warehouse assigned, pick the one with most stock
+          let finalWhId = (item as any).warehouse_id || order.warehouse_id;
+          let finalWhName = (item as any).warehouse_name || order.warehouse_name;
+          if (!finalWhId) {
+            const warehouseStockForItem = (await db.getWarehouseStock()).filter(ws => ws.product_id === item.product_id && ws.qty > 0);
+            const bestWh = warehouseStockForItem.sort((a, b) => b.qty - a.qty)[0];
+            finalWhId = bestWh ? bestWh.warehouse_id : 'wh-main';
+            finalWhName = bestWh ? bestWh.warehouse_name : 'Main Warehouse';
+          }
           await db.createReservation({
             order_id: orderId,
             product_id: item.product_id,
@@ -1002,6 +1173,7 @@ export const db = {
       }
       await db.createPickList(orderId, pickItems);
     }
+
 
     if (newStatus === 'packing') {
       const pls = await db.getPickLists();
@@ -1665,6 +1837,9 @@ export const db = {
       await supabase.from('warehouses').delete().neq('id', '_none_');
       await supabase.from('products').delete().neq('id', '_none_');
       await supabase.from('users').delete().neq('id', 'usr-admin');
+      // Also clear settings
+      await supabase.from('company_settings').delete().neq('id', '_none_');
+      await supabase.from('customer_companies').delete().neq('customer_id', '_none_');
     } else {
       const adminUser = defaultUsers.find(u => u.username === 'sysadmin') || { id: 'usr-admin', username: 'sysadmin', password: 'cfi@2024', name: 'System Admin (CFI)', role: 'admin' };
       saveLocalTable('users', [adminUser]);
@@ -1680,7 +1855,261 @@ export const db = {
       saveLocalTable('stock_reservations', []);
       saveLocalTable('pick_lists', []);
       saveLocalTable('dispatches', []);
+      saveLocalTable('company_settings', [defaultCompanySettings]);
+      saveLocalTable('customer_companies', []);
     }
     await logAction(actor.id, actor.name, actor.role, `Wiped Database`, `Entire database cleared by admin.`);
+  },
+
+  getCompanySettings: async (): Promise<CompanySettings> => {
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.from('company_settings').select('*').eq('id', 'owner-company').single();
+        if (error) {
+          await supabase.from('company_settings').insert([defaultCompanySettings]);
+          return defaultCompanySettings;
+        }
+        return data;
+      } catch (err) {
+        return defaultCompanySettings;
+      }
+    } else {
+      const list = getLocalTable<CompanySettings>('company_settings');
+      if (list.length === 0) {
+        saveLocalTable('company_settings', [defaultCompanySettings]);
+        return defaultCompanySettings;
+      }
+      return list[0];
+    }
+  },
+
+  updateCompanySettings: async (updates: Partial<CompanySettings>, actor: User): Promise<CompanySettings> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('company_settings').update(updates).eq('id', 'owner-company').select().single();
+      if (error) throw error;
+      await logAction(actor.id, actor.name, actor.role, `Updated Company Settings`, JSON.stringify(updates));
+      return data;
+    } else {
+      const list = getLocalTable<CompanySettings>('company_settings');
+      const updated = { ...(list[0] || defaultCompanySettings), ...updates };
+      saveLocalTable('company_settings', [updated]);
+      await logAction(actor.id, actor.name, actor.role, `Updated Company Settings`, JSON.stringify(updates));
+      return updated;
+    }
+  },
+
+  getCustomerCompanyDetails: async (customerId: string): Promise<CustomerCompanyDetails | undefined> => {
+    if (supabase) {
+      const { data, error } = await supabase.from('customer_companies').select('*').eq('customer_id', customerId).single();
+      if (error) return undefined;
+      return data;
+    } else {
+      const list = getLocalTable<CustomerCompanyDetails>('customer_companies');
+      return list.find(cc => cc.customer_id === customerId);
+    }
+  },
+
+  updateCustomerCompanyDetails: async (customerId: string, details: Partial<CustomerCompanyDetails>, actor: User): Promise<CustomerCompanyDetails> => {
+    const defaultDetails: CustomerCompanyDetails = {
+      customer_id: customerId,
+      company_name: '',
+      contact_person: actor.name,
+      address: '',
+      city: '',
+      country: 'Saudi Arabia',
+      postal_code: '',
+      vat_number: '',
+      cr_number: '',
+      phone: '',
+      email: ''
+    };
+
+    if (supabase) {
+      const { data: existing } = await supabase.from('customer_companies').select('*').eq('customer_id', customerId).single();
+      let res;
+      if (existing) {
+        const { data, error } = await supabase.from('customer_companies').update(details).eq('customer_id', customerId).select().single();
+        if (error) throw error;
+        res = data;
+      } else {
+        const { data, error } = await supabase.from('customer_companies').insert([{ ...defaultDetails, ...details }]).select().single();
+        if (error) throw error;
+        res = data;
+      }
+      await logAction(actor.id, actor.name, actor.role, `Updated Customer Company Details for user: ${customerId}`, JSON.stringify(details));
+      return res;
+    } else {
+      const list = getLocalTable<CustomerCompanyDetails>('customer_companies');
+      const existing = list.find(cc => cc.customer_id === customerId);
+      let updated: CustomerCompanyDetails;
+      if (existing) {
+        updated = { ...existing, ...details };
+      } else {
+        updated = { ...defaultDetails, ...details };
+      }
+      const nextList = list.filter(cc => cc.customer_id !== customerId);
+      saveLocalTable('customer_companies', [...nextList, updated]);
+      await logAction(actor.id, actor.name, actor.role, `Updated Customer Company Details for user: ${customerId}`, JSON.stringify(details));
+      return updated;
+    }
+  },
+
+  approveOrderAvailableItems: async (
+    orderId: string,
+    availableItems: OrderItem[],
+    outOfStockItems: OrderItem[],
+    actor: User
+  ): Promise<Order> => {
+    // If supabase is active and we want to perform this atomicly via RPC
+    if (supabase) {
+      try {
+        const { data, error } = await supabase.rpc('approve_order_partial_secure', {
+          p_order_id: orderId,
+          p_available_items: availableItems,
+          p_out_of_stock_items: outOfStockItems,
+          p_actor_id: actor.id,
+          p_actor_name: actor.name,
+          p_actor_role: actor.role
+        });
+        if (error) throw error;
+        return data;
+      } catch (err) {
+        console.warn("Secure partial approval RPC failed or missing, falling back to client-side database writes:", err);
+      }
+    }
+
+    const order = await db.getOrderById(orderId);
+    if (!order) throw new Error('Order not found');
+
+    const customer = await db.getUserById(order.customer_id);
+    if (!customer) throw new Error('Customer not found');
+
+    // Recalculate totals
+    let subtotal = 0;
+    let totalDiscount = 0;
+    const recalculatedItems: OrderItem[] = [];
+
+    for (const item of availableItems) {
+      const prod = await db.getProductById(item.product_id);
+      if (!prod) throw new Error(`Product ${item.product_id} not found`);
+
+      const defaultPrice = prod.selling_price;
+      const finalPrice = db.calculateCustomerPrice(customer, prod);
+      const discountVal = defaultPrice - finalPrice;
+
+      const itemTotal = Number((finalPrice * item.qty).toFixed(2));
+      subtotal += Number((defaultPrice * item.qty).toFixed(2));
+      totalDiscount += Number((discountVal * item.qty).toFixed(2));
+
+      recalculatedItems.push({
+        ...item,
+        unit_price: finalPrice,
+        total: itemTotal
+      });
+    }
+
+    const afterCustomerDiscount = Number((subtotal - totalDiscount).toFixed(2));
+    const manualPctDeduction = Number(((afterCustomerDiscount * order.manual_discount_pct) / 100).toFixed(2));
+    const manualAmtDeduction = Number(Math.min(order.manual_discount_amt, afterCustomerDiscount - manualPctDeduction).toFixed(2));
+    const total = Number((afterCustomerDiscount - (manualPctDeduction + manualAmtDeduction)).toFixed(2));
+
+    const removedSummary = outOfStockItems.map(i => `${i.name} ×${i.qty}`).join(', ');
+    const historyEntry = {
+      status: 'approved' as const,
+      updated_at: new Date().toISOString(),
+      updated_by_name: actor.name,
+      notes: `Approved available items only. Removed out-of-stock: ${removedSummary}`
+    };
+
+    const updatedOrder: Order = {
+      ...order,
+      items: recalculatedItems,
+      removed_items: outOfStockItems,
+      subtotal,
+      discount: totalDiscount,
+      manual_discount_amt: manualAmtDeduction,
+      total,
+      status: 'approved',
+      status_history: [...order.status_history, historyEntry]
+    };
+
+    if (supabase) {
+      await supabase.from('orders').update(updatedOrder).eq('id', orderId);
+    } else {
+      const orders = getLocalTable<Order>('orders');
+      saveLocalTable('orders', orders.map(o => o.id === orderId ? updatedOrder : o));
+    }
+
+    // Now perform stock adjustments and reservations for approved items
+    const pickItems: PickListItem[] = [];
+    for (const item of recalculatedItems) {
+      const splitWh = (item as any).split_warehouses;
+      if (splitWh && splitWh.length > 1) {
+        for (const portion of splitWh) {
+          if (portion.qty <= 0) continue;
+          await db.createReservation({
+            order_id: orderId,
+            product_id: item.product_id,
+            warehouse_id: portion.warehouse_id,
+            qty: portion.qty,
+            status: 'active'
+          });
+          await db.addStockAdjustment(
+            item.product_id,
+            -portion.qty,
+            'customer_sales',
+            `Order ${orderId} approved — moved to temp storage (${portion.warehouse_name})`,
+            actor,
+            portion.warehouse_id
+          );
+        }
+        pickItems.push({
+          product_id: item.product_id,
+          name: item.name,
+          qty: item.qty,
+          warehouse_id: (item as any).warehouse_id || order.warehouse_id || splitWh[0].warehouse_id,
+          warehouse_name: `Split: ${splitWh.map((p: any) => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
+          picked_qty: 0
+        });
+      } else {
+        // SINGLE warehouse — if no warehouse assigned, pick the one with most stock
+        let finalWhId = (item as any).warehouse_id || order.warehouse_id;
+        let finalWhName = (item as any).warehouse_name || order.warehouse_name;
+        if (!finalWhId) {
+          const warehouseStockForItem = (await db.getWarehouseStock()).filter(ws => ws.product_id === item.product_id && ws.qty > 0);
+          const bestWh = warehouseStockForItem.sort((a, b) => b.qty - a.qty)[0];
+          finalWhId = bestWh ? bestWh.warehouse_id : 'wh-main';
+          finalWhName = bestWh ? bestWh.warehouse_name : 'Main Warehouse';
+        }
+        await db.createReservation({
+          order_id: orderId,
+          product_id: item.product_id,
+          warehouse_id: finalWhId,
+          qty: item.qty,
+          status: 'active'
+        });
+        await db.addStockAdjustment(
+          item.product_id,
+          -item.qty,
+          'customer_sales',
+          `Order ${orderId} approved — moved to temp storage (${finalWhName})`,
+          actor,
+          finalWhId
+        );
+        pickItems.push({
+          product_id: item.product_id,
+          name: item.name,
+          qty: item.qty,
+          warehouse_id: finalWhId,
+          warehouse_name: finalWhName,
+          picked_qty: 0
+        });
+      }
+    }
+
+    await db.createPickList(orderId, pickItems);
+    await logAction(actor.id, actor.name, actor.role, `Approved Order ${orderId} partially`, `Approved remaining total: ${total} SAR`);
+    return updatedOrder;
   }
 };
+

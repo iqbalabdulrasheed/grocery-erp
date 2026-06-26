@@ -4,7 +4,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { auth } from "@/services/auth";
 import { supabase } from "@/services/supabaseClient";
-import { db, User, Product, Order, StockLedgerEntry, CustomerLedgerEntry, Expense, AuditLog, Warehouse, WarehouseStock, logAction, StockReservation, PickList, Dispatch } from "@/services/db";
+import { db, User, Product, Order, StockLedgerEntry, CustomerLedgerEntry, Expense, AuditLog, Warehouse, WarehouseStock, logAction, StockReservation, PickList, Dispatch, CompanySettings, CustomerCompanyDetails, OutOfStockError, defaultCompanySettings } from "@/services/db";
 import { 
   Users, Package, ClipboardList, TrendingUp, History, Trash2, 
   UserCheck, Shield, ShoppingBag, Plus, Search, Edit2, Check, 
@@ -27,6 +27,22 @@ export default function DashboardPage() {
   const router = useRouter();
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeTab, setActiveTab] = useState<string>("overview");
+
+  // Out of Stock Dialog state
+  const [showOutOfStockDialog, setShowOutOfStockDialog] = useState(false);
+  const [outOfStockDialogData, setOutOfStockDialogData] = useState<{ orderId: string; availableItems: any[]; outOfStockItems: any[] } | null>(null);
+
+
+  // Owner Company Settings state
+  const [companySettings, setCompanySettings] = useState<CompanySettings | null>(null);
+  const [showCompanySettingsSaved, setShowCompanySettingsSaved] = useState(false);
+  const [companySettingsError, setCompanySettingsError] = useState("");
+
+  // Customer Company Profile state
+  const [customerCompany, setCustomerCompany] = useState<CustomerCompanyDetails | null>(null);
+  const [customerCompanySaved, setCustomerCompanySaved] = useState(false);
+  const [customerCompanyError, setCustomerCompanyError] = useState("");
+
   // Keep window var in sync so auto-refresh interval knows which tab to reload
   React.useEffect(() => { (window as any).__erpActiveTab = activeTab; }, [activeTab]);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -235,6 +251,8 @@ export default function DashboardPage() {
       logs:       async () => { const user = auth.getCurrentUser(); if (user) { const l = await db.getAuditLogs(user); setAuditLogs(l); } },
       warehouses: async () => { const [w, ws] = await Promise.all([db.getWarehouses(), db.getWarehouseStock()]); setWarehouses(w); setWarehouseStock(ws); },
       trash:      async () => { const t = await db.getTrash(); setTrashList(t); },
+      'company-settings': async () => { const s = await db.getCompanySettings(); setCompanySettings(s); },
+      'customer-profile': async () => { const user = auth.getCurrentUser(); if (user) { const cc = await db.getCustomerCompanyDetails(user.id); if (cc) setCustomerCompany(cc); } },
     };
     await (fetchers[tab] || fetchers.overview)();
   }, []);
@@ -248,11 +266,12 @@ export default function DashboardPage() {
     }
     setCurrentUser(user);
 
-    const [prods, ords, stk, usrs, exps, logs, trash, whs, whStk, res, pls, dps] = await Promise.all([
+    const [prods, ords, stk, usrs, exps, logs, trash, whs, whStk, res, pls, dps, settings] = await Promise.all([
       db.getProducts(), db.getOrders(), db.getStockLedger(), db.getUsers(),
       db.getExpenses(), db.getAuditLogs(user), db.getTrash(),
       db.getWarehouses(), db.getWarehouseStock(),
-      db.getReservations(), db.getPickLists(), db.getDispatches()
+      db.getReservations(), db.getPickLists(), db.getDispatches(),
+      db.getCompanySettings()
     ]);
 
     setProducts(prods);
@@ -267,6 +286,13 @@ export default function DashboardPage() {
     setStockReservations(res);
     setPickLists(pls);
     setDispatches(dps);
+    setCompanySettings(settings);
+
+    if (user.role === 'customer') {
+      const cc = await db.getCustomerCompanyDetails(user.id);
+      if (cc) setCustomerCompany(cc);
+    }
+
     // Customers never get a warehouse pre-selected — they order against combined stock
     const loggedInUser = auth.getCurrentUser();
     if (!selectedWarehouseId && whs.length > 0 && loggedInUser?.role !== 'customer') {
@@ -297,6 +323,7 @@ export default function DashboardPage() {
 
     setNotifications(alerts);
   };
+
 
   const handleWipeDatabase = async () => {
     if (!currentUser) return;
@@ -822,16 +849,19 @@ export default function DashboardPage() {
     };
 
     // Optimistic: reserve stock and add order immediately
-    const tempResList: StockReservation[] = cart.map(c => ({
-      id: `res-temp-${Date.now()}-${c.product_id}`,
-      order_id: tempOrderId,
-      product_id: c.product_id,
-      warehouse_id: selectedWarehouseId || 'wh-main',
-      qty: c.qty,
-      status: 'active',
-      created_at: new Date().toISOString()
-    }));
-    setStockReservations(prev => [...tempResList, ...prev]);
+    const isApprovedImmediately = ['admin', 'superowner', 'owner', 'manager'].includes(currentUser.role);
+    if (isApprovedImmediately) {
+      const tempResList: StockReservation[] = cart.map(c => ({
+        id: `res-temp-${Date.now()}-${c.product_id}`,
+        order_id: tempOrderId,
+        product_id: c.product_id,
+        warehouse_id: selectedWarehouseId || 'wh-main',
+        qty: c.qty,
+        status: 'active',
+        created_at: new Date().toISOString()
+      }));
+      setStockReservations(prev => [...tempResList, ...prev]);
+    }
     setOrders(prev => [tempOrder, ...prev]);
     setCart([]);
     setSelectedCustomerId("");
@@ -854,7 +884,231 @@ export default function DashboardPage() {
     }
   };
 
-  // TRASH HANDLERS
+  const getZatcaTlv = (
+    sellerName: string,
+    sellerVat: string,
+    timestamp: string,
+    totalAmount: number,
+    vatAmount: number
+  ): string => {
+    const encoder = new TextEncoder();
+    
+    const toTlvSegment = (tag: number, value: string): Uint8Array => {
+      const valBytes = encoder.encode(value);
+      const len = valBytes.length;
+      const segment = new Uint8Array(2 + len);
+      segment[0] = tag;
+      segment[1] = len;
+      segment.set(valBytes, 2);
+      return segment;
+    };
+
+    const seg1 = toTlvSegment(1, sellerName);
+    const seg2 = toTlvSegment(2, sellerVat);
+    const seg3 = toTlvSegment(3, timestamp);
+    const seg4 = toTlvSegment(4, totalAmount.toFixed(2));
+    const seg5 = toTlvSegment(5, vatAmount.toFixed(2));
+
+    const totalLength = seg1.length + seg2.length + seg3.length + seg4.length + seg5.length;
+    const tlvBytes = new Uint8Array(totalLength);
+    
+    let offset = 0;
+    tlvBytes.set(seg1, offset); offset += seg1.length;
+    tlvBytes.set(seg2, offset); offset += seg2.length;
+    tlvBytes.set(seg3, offset); offset += seg3.length;
+    tlvBytes.set(seg4, offset); offset += seg4.length;
+    tlvBytes.set(seg5, offset);
+
+    let binary = '';
+    const len = tlvBytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(tlvBytes[i]);
+    }
+    return window.btoa(binary);
+  };
+
+  const handleGenerateInvoice = async (order: Order) => {
+    const seller = companySettings || defaultCompanySettings;
+    let customerComp: CustomerCompanyDetails | undefined;
+    try {
+      customerComp = await db.getCustomerCompanyDetails(order.customer_id);
+    } catch (e) {}
+
+    const grandTotal = order.total;
+    const vatTotal = grandTotal * (15 / 115);
+    const subtotalBeforeVat = grandTotal - vatTotal;
+    const invoiceTime = order.created_at || new Date().toISOString();
+    const invoiceDateStr = new Date(invoiceTime).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+
+    const logoImg = seller.logo_url
+      ? `<img src="${seller.logo_url}" class="header-logo" alt="Logo" />`
+      : `<div style="font-size:18px;font-weight:800;color:#3b82f6;">${seller.name}</div>`;
+    const stampImg = seller.stamp_url
+      ? `<img src="${seller.stamp_url}" class="footer-stamp" alt="Stamp" /><br />`
+      : '';
+
+    const itemsHtml = order.items.map(item => {
+      const p = products.find(pr => pr.id === item.product_id);
+      const sku = p ? p.sku : 'N/A';
+      const itemVat = item.total * (15 / 115);
+      const itemUnitPriceExVat = item.unit_price / 1.15;
+      return `<tr class="item-row">
+        <td><div class="item-name">${item.name}</div></td>
+        <td class="tc mono">${sku}</td>
+        <td class="tc">${item.qty}</td>
+        <td class="tr">${formatSAR(itemUnitPriceExVat)}</td>
+        <td class="tc">15%</td>
+        <td class="tr">${formatSAR(itemVat)}</td>
+        <td class="tr bold">${formatSAR(item.total)}</td>
+      </tr>`;
+    }).join('');
+
+    const html = `<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="UTF-8">
+  <title>Invoice-${order.id}</title>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    @media print {
+      body { margin:0; padding:0; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+      .no-print { display:none !important; }
+    }
+    * { box-sizing:border-box; font-family:'Outfit',sans-serif; }
+    body { background:#fff; color:#1e293b; margin:0; padding:40px; font-size:11px; line-height:1.5; }
+    .invoice-container { width:100%; max-width:800px; margin:0 auto; }
+    .header-table { width:100%; border-collapse:collapse; margin-bottom:25px; }
+    .header-logo { width:120px; max-height:80px; object-fit:contain; }
+    .invoice-title { font-size:20px; font-weight:800; color:#0f172a; text-align:center; margin:0 0 5px 0; }
+    .invoice-title-arabic { font-size:18px; font-weight:700; color:#475569; text-align:center; margin:0; }
+    .metadata-bar { background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 15px; margin-bottom:25px; display:flex; justify-content:space-between; align-items:center; }
+    .info-grid { display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-bottom:25px; }
+    .info-card { border:1px solid #e2e8f0; border-radius:8px; padding:15px; }
+    .card-title { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; color:#3b82f6; border-bottom:1px dashed #e2e8f0; padding-bottom:8px; margin-bottom:10px; display:flex; justify-content:space-between; }
+    .info-row { display:flex; justify-content:space-between; margin-bottom:6px; }
+    .info-label { color:#64748b; font-weight:500; }
+    .info-value { color:#0f172a; font-weight:600; text-align:right; }
+    .items-table { width:100%; border-collapse:collapse; margin-bottom:25px; }
+    .items-table th { background:#f1f5f9; color:#475569; font-weight:700; font-size:9px; text-transform:uppercase; letter-spacing:0.5px; padding:10px 12px; border-top:1px solid #cbd5e1; border-bottom:1px solid #cbd5e1; }
+    .items-table td { padding:12px; border-bottom:1px solid #e2e8f0; vertical-align:middle; }
+    .item-name { font-weight:700; color:#0f172a; font-size:11px; }
+    .tc { text-align:center; } .tr { text-align:right; } .mono { font-family:monospace; } .bold { font-weight:700; }
+    .totals-box { width:320px; border:1px solid #e2e8f0; border-radius:8px; overflow:hidden; margin-left:auto; }
+    .totals-row { display:flex; justify-content:space-between; padding:8px 12px; border-bottom:1px solid #e2e8f0; font-size:10px; }
+    .totals-row:last-child { border-bottom:none; }
+    .totals-row.grand-total { background:#3b82f6; color:#fff; font-size:12px; font-weight:800; }
+    .footer { border-top:1px solid #cbd5e1; padding-top:15px; margin-top:40px; text-align:center; color:#64748b; font-size:9px; }
+    .footer-stamp { width:100px; max-height:80px; object-fit:contain; margin-bottom:10px; opacity:0.85; }
+  </style>
+</head>
+<body>
+  <div class="invoice-container">
+    <table class="header-table">
+      <tr>
+        <td style="width:33%;vertical-align:top;">${logoImg}</td>
+        <td style="width:34%;text-align:center;vertical-align:middle;">
+          <h2 class="invoice-title">TAX INVOICE</h2>
+          <h3 class="invoice-title-arabic">فاتورة ضريبية</h3>
+        </td>
+        <td style="width:33%;text-align:right;vertical-align:top;">
+          <div style="font-size:9px;color:#64748b;font-weight:600;">Original / النسخة الأصلية</div>
+        </td>
+      </tr>
+    </table>
+
+    <div class="metadata-bar">
+      <div><span class="info-label">Invoice No / رقم الفاتورة: </span><span class="info-value">${order.id}</span></div>
+      <div><span class="info-label">Date / التاريخ: </span><span class="info-value">${invoiceDateStr}</span></div>
+      <div><span class="info-label">Payment / طريقة الدفع: </span><span class="info-value" style="text-transform:uppercase;">${order.type === 'normal' ? 'Credit' : order.type}</span></div>
+    </div>
+
+    <div class="info-grid">
+      <div class="info-card">
+        <div class="card-title"><span>Seller Details</span><span>بيانات المورد</span></div>
+        <div class="info-row"><span class="info-label">Company / الشركة:</span><span class="info-value">${seller.name}</span></div>
+        <div class="info-row"><span class="info-label">VAT No / الرقم الضريبي:</span><span class="info-value">${seller.vat_number}</span></div>
+        <div class="info-row"><span class="info-label">CR No / السجل التجاري:</span><span class="info-value">${seller.cr_number}</span></div>
+        ${seller.zakat_number ? `<div class="info-row"><span class="info-label">Zakat No:</span><span class="info-value">${seller.zakat_number}</span></div>` : ''}
+        <div class="info-row"><span class="info-label">Address / العنوان:</span><span class="info-value">${seller.address}, ${seller.city}</span></div>
+        <div class="info-row"><span class="info-label">Tel / الهاتف:</span><span class="info-value">${seller.phone}</span></div>
+      </div>
+      <div class="info-card">
+        <div class="card-title"><span>Customer Details</span><span>بيانات العميل</span></div>
+        <div class="info-row"><span class="info-label">Name / الاسم:</span><span class="info-value">${customerComp?.company_name || order.customer_name}</span></div>
+        ${customerComp ? `
+        <div class="info-row"><span class="info-label">Contact:</span><span class="info-value">${customerComp.contact_person}</span></div>
+        <div class="info-row"><span class="info-label">VAT No:</span><span class="info-value">${customerComp.vat_number || 'N/A'}</span></div>
+        <div class="info-row"><span class="info-label">CR No:</span><span class="info-value">${customerComp.cr_number || 'N/A'}</span></div>
+        <div class="info-row"><span class="info-label">Address:</span><span class="info-value">${customerComp.address || 'N/A'}, ${customerComp.city || ''}</span></div>
+        <div class="info-row"><span class="info-label">Tel:</span><span class="info-value">${customerComp.phone || 'N/A'}</span></div>
+        ` : `
+        <div class="info-row"><span class="info-label">Customer ID:</span><span class="info-value">${order.customer_id}</span></div>
+        <div class="info-row"><span class="info-label">Account:</span><span class="info-value">Standard Retail</span></div>
+        `}
+      </div>
+    </div>
+
+    <table class="items-table">
+      <thead>
+        <tr>
+          <th style="text-align:left;width:38%;">Description / الوصف</th>
+          <th style="width:13%;">SKU</th>
+          <th style="width:8%;">Qty</th>
+          <th style="text-align:right;width:13%;">Unit Price (Ex VAT)</th>
+          <th style="width:7%;">VAT%</th>
+          <th style="text-align:right;width:11%;">VAT Amount</th>
+          <th style="text-align:right;width:10%;">Total</th>
+        </tr>
+      </thead>
+      <tbody>${itemsHtml}</tbody>
+    </table>
+
+    <div class="totals-box">
+      <div class="totals-row"><span class="info-label">Subtotal (Ex VAT):</span><span class="info-value">${formatSAR(subtotalBeforeVat)}</span></div>
+      <div class="totals-row"><span class="info-label">VAT (15%):</span><span class="info-value">${formatSAR(vatTotal)}</span></div>
+      ${order.discount > 0 ? `<div class="totals-row"><span class="info-label">Discount:</span><span class="info-value" style="color:#ef4444;">- ${formatSAR(order.discount)}</span></div>` : ''}
+      <div class="totals-row grand-total"><span>Grand Total (Inc VAT) / المجموع النهائي:</span><span>${formatSAR(grandTotal)}</span></div>
+    </div>
+
+    <div class="footer">
+      ${stampImg}
+      <p style="margin:0 0 5px 0;font-weight:700;">${seller.name} · VAT: ${seller.vat_number} · CR: ${seller.cr_number}</p>
+      <p style="margin:0;">${seller.address}, ${seller.city}, ${seller.postal_code}, ${seller.country} | Tel: ${seller.phone} | ${seller.email}</p>
+    </div>
+  </div>
+  <script>
+    document.title = 'Invoice-${order.id}';
+  </script>
+</body>
+</html>`;
+
+    // Inject a hidden iframe into the current page, write the invoice HTML into it,
+    // then call print() on it — no new tab, no navigation, just the print dialog.
+    const existingFrame = document.getElementById('__invoice_print_frame__');
+    if (existingFrame) existingFrame.remove();
+
+    const frame = document.createElement('iframe');
+    frame.id = '__invoice_print_frame__';
+    frame.style.cssText = 'position:fixed;top:0;left:0;width:0;height:0;border:0;opacity:0;pointer-events:none;';
+    document.body.appendChild(frame);
+
+    const frameDoc = frame.contentDocument || frame.contentWindow?.document;
+    if (!frameDoc) return;
+    frameDoc.open();
+    frameDoc.write(html);
+    frameDoc.close();
+
+    frame.onload = () => {
+      setTimeout(() => {
+        const prevTitle = document.title;
+        document.title = 'Invoice - ' + order.id;
+        frame.contentWindow?.print();
+        setTimeout(() => { document.title = prevTitle; }, 2000);
+      }, 300);
+    };
+  };
+
+    // TRASH HANDLERS
   const cancelOrder = async () => {
     if (!cancelOrderId) return;
     if (!cancelReason.trim()) { alert("Please enter a cancellation reason."); return; }
@@ -1285,7 +1539,38 @@ export default function DashboardPage() {
               Trash Bin
             </button>
           )}
+
+          {/* Owner Company Settings */}
+          {['admin', 'superowner', 'owner'].includes(currentUser.role) && (
+            <button
+              onClick={() => { setActiveTab("company-settings"); setSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
+                activeTab === "company-settings"
+                  ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                  : "text-slate-600 dark:text-gray-400 hover:bg-slate-200 dark:hover:bg-white/5 hover:text-slate-900 dark:hover:text-white"
+              }`}
+            >
+              <Settings className="w-4 h-4" />
+              Company Settings
+            </button>
+          )}
+
+          {/* Customer Company Profile */}
+          {currentUser.role === 'customer' && (
+            <button
+              onClick={() => { setActiveTab("customer-profile"); setSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
+                activeTab === "customer-profile"
+                  ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                  : "text-slate-600 dark:text-gray-400 hover:bg-slate-200 dark:hover:bg-white/5 hover:text-slate-900 dark:hover:text-white"
+              }`}
+            >
+              <Users className="w-4 h-4" />
+              My Company Profile
+            </button>
+          )}
         </nav>
+
 
         {/* Footer Logout */}
         <div className="p-4 border-t border-slate-200 dark:border-white/5">
@@ -2370,7 +2655,16 @@ export default function DashboardPage() {
                   })();
 
                   return (
-                    <div key={order.id} className={`glass-panel rounded-xl p-5 border border-slate-200 dark:border-white/5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 animate-fade-in${isThisOrderLoading ? ' opacity-60 pointer-events-none' : ''}`}>
+                    <div key={order.id} className={`relative glass-panel rounded-xl p-5 border border-slate-200 dark:border-white/5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 animate-fade-in${isThisOrderLoading ? ' opacity-60 pointer-events-none' : ''}`}>
+                      {/* Invoice button — top right corner */}
+                      <button
+                        onClick={() => handleGenerateInvoice(order)}
+                        title="Print / Save Invoice PDF"
+                        className="absolute top-3 right-3 flex items-center gap-1 px-2 py-1 rounded-lg bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 text-[10px] font-bold transition z-10"
+                      >
+                        <Printer className="w-3 h-3" />
+                        Invoice
+                      </button>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="text-xs font-mono font-bold text-blue-600 dark:text-blue-400">{order.id}</span>
@@ -2753,7 +3047,7 @@ export default function DashboardPage() {
                           )}
                         </div>
 
-                        <div className="flex gap-2 shrink-0">
+                        <div className="flex gap-2 shrink-0 items-center">
                           <span className={`inline-flex px-3 py-1.5 rounded-lg text-xs font-bold items-center ${
                             currentStatus === 'created' ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20' :
                             currentStatus === 'approved' ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20' :
@@ -2767,6 +3061,7 @@ export default function DashboardPage() {
                               ? (order.status_history.find((h: any) => h.status === 'failed' && h.notes) ? 'Cancelled' : 'Failed')
                               : currentStatus}
                           </span>
+
                           {currentStatus === 'failed' && (() => {
                             const cancelEntry = order.status_history.find((h: any) => h.status === 'failed' && h.notes);
                             return cancelEntry ? (
@@ -2793,8 +3088,21 @@ export default function DashboardPage() {
                                       await db.saveOrderItemWarehouses(order.id, autoSelections, currentUser);
                                     }
                                   }
-                                  await db.updateOrderStatus(order.id, 'approved', currentUser);
-                                  await reloadOrdersAndStock();
+                                  try {
+                                    await db.updateOrderStatus(order.id, 'approved', currentUser);
+                                    await reloadOrdersAndStock();
+                                  } catch (err: any) {
+                                    if (err instanceof OutOfStockError) {
+                                      setOutOfStockDialogData({
+                                        orderId: order.id,
+                                        availableItems: err.availableItems,
+                                        outOfStockItems: err.outOfStockItems
+                                      });
+                                      setShowOutOfStockDialog(true);
+                                    } else {
+                                      alert(err.message || "Failed to approve order.");
+                                    }
+                                  }
                                 })}
                                 className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
                               >
@@ -4091,6 +4399,366 @@ export default function DashboardPage() {
             </div>
           )}
 
+          {/* Owner Company Settings tab */}
+          {activeTab === "company-settings" && ['admin', 'superowner', 'owner'].includes(currentUser.role) && (
+            <div className="space-y-6 animate-fade-in">
+              <div>
+                <h2 className="text-xl font-bold text-slate-950 dark:text-white">Owner Company Settings</h2>
+                <p className="text-xs text-slate-500 dark:text-gray-400">Configure your business details. These fields are automatically displayed on generated tax invoices.</p>
+              </div>
+
+              {companySettingsError && (
+                <div className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-500/20 text-red-700 dark:text-red-300 text-xs font-semibold">
+                  ⚠️ {companySettingsError}
+                </div>
+              )}
+
+              {showCompanySettingsSaved && (
+                <div className="p-3.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-xs font-semibold">
+                  ✓ Company settings saved successfully!
+                </div>
+              )}
+
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setCompanySettingsError("");
+                  setShowCompanySettingsSaved(false);
+
+                  // Validate VAT (15 digits, starts and ends with 3)
+                  if (companySettings?.vat_number && !/^3\d{13}3$/.test(companySettings.vat_number.trim())) {
+                    setCompanySettingsError("VAT Number must be exactly 15 digits, starting and ending with '3'.");
+                    return;
+                  }
+
+                  // Validate CR Number (10 digits)
+                  if (companySettings?.cr_number && !/^\d{10}$/.test(companySettings.cr_number.trim())) {
+                    setCompanySettingsError("CR Number (Commercial Registration) must be exactly 10 digits.");
+                    return;
+                  }
+
+                  // Validate Zakat Number (10 digits)
+                  if (companySettings?.zakat_number && !/^\d{10}$/.test(companySettings.zakat_number.trim())) {
+                    setCompanySettingsError("Zakat Number must be exactly 10 digits.");
+                    return;
+                  }
+
+                  try {
+                    const updated = await db.updateCompanySettings(companySettings || {}, currentUser);
+                    setCompanySettings(updated);
+                    setShowCompanySettingsSaved(true);
+                    setTimeout(() => setShowCompanySettingsSaved(false), 4000);
+                  } catch (err: any) {
+                    setCompanySettingsError(err.message || "Failed to save company settings.");
+                  }
+                }}
+                className="glass-panel rounded-xl p-6 border border-slate-200 dark:border-white/5 space-y-4 text-xs"
+              >
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Name</label>
+                    <input
+                      type="text"
+                      required
+                      value={companySettings?.name || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, name: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. Zenvora Distribution Ltd"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">VAT Number (15-digit)</label>
+                    <input
+                      type="text"
+                      required
+                      value={companySettings?.vat_number || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, vat_number: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 310123456700003"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">CR Number (10-digit)</label>
+                    <input
+                      type="text"
+                      required
+                      value={companySettings?.cr_number || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, cr_number: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 1010987654"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Zakat Number (10-digit)</label>
+                    <input
+                      type="text"
+                      value={companySettings?.zakat_number || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, zakat_number: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 3101234567"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Business License Number</label>
+                    <input
+                      type="text"
+                      value={companySettings?.business_license_number || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, business_license_number: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. LIC-2026-8890"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Website</label>
+                    <input
+                      type="text"
+                      value={companySettings?.website || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, website: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. www.zenvora.com"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Phone Number</label>
+                    <input
+                      type="text"
+                      value={companySettings?.phone || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, phone: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. +966 11 456 7890"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Email</label>
+                    <input
+                      type="email"
+                      value={companySettings?.email || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, email: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. info@zenvora.com"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Address</label>
+                    <input
+                      type="text"
+                      value={companySettings?.address || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, address: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 4259 King Abdulaziz Road"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">City</label>
+                    <input
+                      type="text"
+                      value={companySettings?.city || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, city: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. Riyadh"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Postal Code</label>
+                    <input
+                      type="text"
+                      value={companySettings?.postal_code || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, postal_code: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 12211"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Logo (Image URL)</label>
+                    <input
+                      type="text"
+                      value={companySettings?.logo_url || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, logo_url: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. https://example.com/logo.png"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Stamp (Image URL)</label>
+                    <input
+                      type="text"
+                      value={companySettings?.stamp_url || ""}
+                      onChange={(e) => setCompanySettings(prev => prev ? { ...prev, stamp_url: e.target.value } : null)}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. https://example.com/stamp.png"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end pt-4 border-t border-slate-200 dark:border-white/5">
+                  <button
+                    type="submit"
+                    className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg transition text-xs shadow-lg cursor-pointer"
+                  >
+                    Save Company Settings
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+
+          {/* Customer Company Profile tab */}
+          {activeTab === "customer-profile" && currentUser.role === 'customer' && (
+            <div className="space-y-6 animate-fade-in">
+              <div>
+                <h2 className="text-xl font-bold text-slate-950 dark:text-white">My Company Profile</h2>
+                <p className="text-xs text-slate-500 dark:text-gray-400">Manage your business settings. These details are used automatically when generating wholesale tax invoices.</p>
+              </div>
+
+              {customerCompanyError && (
+                <div className="p-3.5 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-500/20 text-red-700 dark:text-red-300 text-xs font-semibold">
+                  ⚠️ {customerCompanyError}
+                </div>
+              )}
+
+              {customerCompanySaved && (
+                <div className="p-3.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-300 text-xs font-semibold">
+                  ✓ Profile saved successfully!
+                </div>
+              )}
+
+              <form
+                onSubmit={async (e) => {
+                  e.preventDefault();
+                  setCustomerCompanyError("");
+                  setCustomerCompanySaved(false);
+
+                  // Validate VAT (15 digits, starts and ends with 3)
+                  if (customerCompany?.vat_number && !/^3\d{13}3$/.test(customerCompany.vat_number.trim())) {
+                    setCustomerCompanyError("VAT Number must be exactly 15 digits, starting and ending with '3'.");
+                    return;
+                  }
+
+                  // Validate CR Number (10 digits)
+                  if (customerCompany?.cr_number && !/^\d{10}$/.test(customerCompany.cr_number.trim())) {
+                    setCustomerCompanyError("CR Number must be exactly 10 digits.");
+                    return;
+                  }
+
+                  try {
+                    const res = await db.updateCustomerCompanyDetails(currentUser.id, customerCompany || {}, currentUser);
+                    setCustomerCompany(res);
+                    setCustomerCompanySaved(true);
+                    setTimeout(() => setCustomerCompanySaved(false), 4000);
+                  } catch (err: any) {
+                    setCustomerCompanyError(err.message || "Failed to save profile.");
+                  }
+                }}
+                className="glass-panel rounded-xl p-6 border border-slate-200 dark:border-white/5 space-y-4 text-xs"
+              >
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Name</label>
+                    <input
+                      type="text"
+                      required
+                      value={customerCompany?.company_name || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, company_name: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. Al-Najah Supermarkets Corp"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Contact Person</label>
+                    <input
+                      type="text"
+                      required
+                      value={customerCompany?.contact_person || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, contact_person: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. Abdullah bin Khalid"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">VAT Number (15-digit)</label>
+                    <input
+                      type="text"
+                      value={customerCompany?.vat_number || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, vat_number: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 310111222300003"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">CR Number (10-digit)</label>
+                    <input
+                      type="text"
+                      value={customerCompany?.cr_number || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, cr_number: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 1010112233"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Phone Number</label>
+                    <input
+                      type="text"
+                      value={customerCompany?.phone || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, phone: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. +966 50 123 4567"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Company Email</label>
+                    <input
+                      type="email"
+                      value={customerCompany?.email || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, email: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. store@alnajah.com"
+                    />
+                  </div>
+                  <div className="md:col-span-2">
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Address</label>
+                    <input
+                      type="text"
+                      value={customerCompany?.address || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, address: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 8891 Olaya District"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">City</label>
+                    <input
+                      type="text"
+                      value={customerCompany?.city || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, city: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. Riyadh"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-500 dark:text-gray-400 font-bold uppercase tracking-wider mb-1">Postal Code</label>
+                    <input
+                      type="text"
+                      value={customerCompany?.postal_code || ""}
+                      onChange={(e) => setCustomerCompany(prev => ({ ...prev!, postal_code: e.target.value }))}
+                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      placeholder="e.g. 12214"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end pt-4 border-t border-slate-200 dark:border-white/5">
+                  <button
+                    type="submit"
+                    className="px-6 py-2.5 bg-blue-600 hover:bg-blue-500 text-white font-bold rounded-lg transition text-xs shadow-lg cursor-pointer"
+                  >
+                    Save My Company Profile
+                  </button>
+                </div>
+              </form>
+            </div>
+          )}
+
+
         </div>
       </main>
 
@@ -4681,6 +5349,121 @@ export default function DashboardPage() {
         </div>
       )}
 
+      {/* OUT OF STOCK DIALOG */}
+      {showOutOfStockDialog && outOfStockDialogData && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex justify-center items-center p-4 z-50 animate-fade-in">
+          <div className="glass-panel w-full max-w-lg rounded-xl p-6 border border-amber-300/40 dark:border-amber-500/20 shadow-2xl space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-slate-200 dark:border-white/5">
+              <div className="w-10 h-10 rounded-lg bg-amber-100 dark:bg-amber-950/30 flex items-center justify-center text-amber-600 dark:text-amber-400">
+                <AlertTriangle className="w-6 h-6 animate-pulse" />
+              </div>
+              <div>
+                <h3 className="text-sm font-extrabold text-slate-900 dark:text-white uppercase tracking-wider">
+                  Out of Stock Warning
+                </h3>
+                <p className="text-[10px] text-slate-500 dark:text-gray-400 font-semibold">
+                  Order ID: {outOfStockDialogData.orderId} · Stock validation failed
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3 text-xs">
+              <p className="text-[11px] text-slate-600 dark:text-gray-300 leading-relaxed">
+                The following items have insufficient stock and cannot be fully fulfilled. Please choose how you want to resolve this:
+              </p>
+
+              {/* OUT OF STOCK ITEMS */}
+              <div className="space-y-1.5">
+                <span className="text-[10px] font-bold text-red-600 dark:text-red-400 uppercase tracking-wider">Out of Stock Items</span>
+                <div className="max-h-28 overflow-y-auto rounded-lg border border-red-200 dark:border-red-500/20 bg-red-50/50 dark:bg-red-950/10 p-2.5 space-y-1.5">
+                  {outOfStockDialogData.outOfStockItems.map((item, idx) => (
+                    <div key={idx} className="flex justify-between items-center text-[11px]">
+                      <span className="font-bold text-slate-800 dark:text-gray-200">{item.name}</span>
+                      <span className="font-mono text-red-600 dark:text-red-400 font-bold">Qty Ordered: {item.qty}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* AVAILABLE ITEMS */}
+              {outOfStockDialogData.availableItems.length > 0 && (
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400 uppercase tracking-wider">Available Items</span>
+                  <div className="max-h-28 overflow-y-auto rounded-lg border border-emerald-200 dark:border-emerald-500/20 bg-emerald-50/50 dark:bg-emerald-950/10 p-2.5 space-y-1.5">
+                    {outOfStockDialogData.availableItems.map((item, idx) => (
+                      <div key={idx} className="flex justify-between items-center text-[11px]">
+                        <span className="font-semibold text-slate-800 dark:text-gray-200">{item.name}</span>
+                        <span className="font-mono text-emerald-600 dark:text-emerald-400 font-bold">Qty Available: {item.qty}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/5 rounded-lg p-3 text-[11px] text-slate-600 dark:text-gray-400 space-y-1.5">
+              <p><strong>Option 1: Approve available items only</strong> - Removes out-of-stock items, recalculates totals, and approves available items.</p>
+              <p><strong>Option 2: Keep pending</strong> - Keeps the order in its current pending status.</p>
+              <p><strong>Option 3: Cancel order</strong> - Marks the order as failed/cancelled.</p>
+            </div>
+
+            <div className="flex flex-col sm:flex-row justify-end gap-2 pt-3 border-t border-slate-200 dark:border-white/5 text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowOutOfStockDialog(false);
+                  setOutOfStockDialogData(null);
+                }}
+                className="px-4 py-2 bg-slate-200 dark:bg-white/5 hover:bg-slate-300 dark:hover:bg-white/10 text-slate-800 dark:text-white rounded-lg transition"
+              >
+                Keep Pending
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (confirm("Are you sure you want to cancel this order?")) {
+                    try {
+                      await db.updateOrderStatus(outOfStockDialogData.orderId, 'failed', currentUser, { cancelReason: "Cancelled due to out of stock items" });
+                      setShowOutOfStockDialog(false);
+                      setOutOfStockDialogData(null);
+                      await reloadOrdersAndStock();
+                    } catch (err: any) {
+                      alert(err.message || "Failed to cancel order.");
+                    }
+                  }
+                }}
+                className="px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold rounded-lg transition"
+              >
+                Cancel Order
+              </button>
+              {outOfStockDialogData.availableItems.length > 0 && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await db.approveOrderAvailableItems(
+                        outOfStockDialogData.orderId,
+                        outOfStockDialogData.availableItems,
+                        outOfStockDialogData.outOfStockItems,
+                        currentUser
+                      );
+                      setShowOutOfStockDialog(false);
+                      setOutOfStockDialogData(null);
+                      await reloadOrdersAndStock();
+                    } catch (err: any) {
+                      alert(err.message || "Failed to approve available items.");
+                    }
+                  }}
+                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white font-bold rounded-lg transition"
+                >
+                  Approve Available Remaining
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* CANCEL ORDER MODAL */}
       {showCancelModal && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex justify-center items-center p-4 z-50 animate-fade-in">
@@ -5138,6 +5921,7 @@ export default function DashboardPage() {
           </div>
         </div>
       )}
+
 
     </div>
   );
