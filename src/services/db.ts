@@ -6,7 +6,7 @@ export interface User {
   username: string;
   password?: string;
   name: string;
-  role: 'admin' | 'superowner' | 'owner' | 'manager' | 'staff' | 'delivery' | 'customer' | 'accountant';
+  role: 'admin' | 'superowner' | 'owner' | 'manager' | 'warehouse_manager' | 'staff' | 'delivery' | 'customer' | 'accountant';
   credit_limit?: number;
   outstanding_balance?: number;
   opening_balance?: number;
@@ -401,7 +401,7 @@ export const db = {
     const newUser: User = {
       ...user,
       id: `usr-${Date.now()}`,
-      outstanding_balance: 0
+      outstanding_balance: user.opening_balance || 0
     };
 
     if (supabase) {
@@ -410,6 +410,26 @@ export const db = {
     } else {
       const users = getLocalTable<User>('users');
       saveLocalTable('users', [...users, newUser]);
+    }
+
+    // If customer has an opening balance, seed the ledger so their balance history starts correctly
+    if (newUser.role === 'customer' && newUser.opening_balance && newUser.opening_balance > 0) {
+      const openingEntry: CustomerLedgerEntry = {
+        id: `ldg-ob-${Date.now()}`,
+        customer_id: newUser.id,
+        type: 'opening',
+        ref_id: newUser.id,
+        amount: newUser.opening_balance,
+        balance_after: newUser.opening_balance,
+        timestamp: new Date().toISOString(),
+        notes: `Opening balance on account creation`
+      };
+      if (supabase) {
+        await supabase.from('customer_ledger').insert([openingEntry]);
+      } else {
+        const ledger = getLocalTable<CustomerLedgerEntry>('customer_ledger');
+        saveLocalTable('customer_ledger', [...ledger, openingEntry]);
+      }
     }
 
     await logAction(actor.id, actor.name, actor.role, `Created User: ${newUser.name} (${newUser.role})`, `Username: ${newUser.username}`);
@@ -855,7 +875,10 @@ export const db = {
     actor: User,
     manualDiscountPct: number = 0,
     manualDiscountAmt: number = 0,
-    warehouseId?: string
+    // Deprecated: warehouse is now chosen automatically (primary first, overflow combined
+    // from other warehouses as needed). This parameter is ignored but kept so older
+    // callers don't break.
+    _ignoredWarehouseId?: string
   ): Promise<Order> => {
     const customer = await db.getUserById(customerId);
     if (!customer) throw new Error('Customer not found');
@@ -899,15 +922,11 @@ export const db = {
     }
 
     let initialStatus: Order['status'] = 'created';
-    if (['admin', 'superowner', 'owner', 'manager'].includes(actor.role)) {
+    if (['admin', 'superowner', 'owner', 'manager', 'warehouse_manager'].includes(actor.role)) {
       initialStatus = 'approved';
     }
 
-    let whName: string | undefined;
-    if (warehouseId) {
-      const whs = await db.getWarehouses();
-      whName = whs.find(w => w.id === warehouseId)?.name;
-    }
+    const primaryWh = await db.getPrimaryWarehouse();
 
     const newOrder: Order = {
       id: `ORD-${Date.now().toString().slice(-4)}${Math.floor(Math.random() * 10)}`,
@@ -924,8 +943,8 @@ export const db = {
       manual_discount_pct: manualDiscountPct,
       manual_discount_amt: manualAmtDeduction,
       total,
-      warehouse_id: warehouseId,
-      warehouse_name: whName,
+      warehouse_id: primaryWh?.id,
+      warehouse_name: primaryWh?.name,
       cod_tracking: codTracking,
       status_history: [
         { status: 'created', updated_at: new Date().toISOString(), updated_by_name: actor.name }
@@ -951,33 +970,68 @@ export const db = {
     await logAction(actor.id, actor.name, actor.role, `Created Order ${newOrder.id}`, `Total: ${total} SAR`);
 
     if (initialStatus === 'approved') {
-      for (const item of orderItems) {
-        const finalWhId = item.warehouse_id || warehouseId || 'wh-main';
-        const finalWhName = item.warehouse_name || whName || 'Main Warehouse';
-        // Reserve for UI tracking
-        await db.createReservation({
-          order_id: newOrder.id,
-          product_id: item.product_id,
-          warehouse_id: finalWhId,
-          qty: item.qty,
-          status: 'active'
-        });
-        // Immediately deduct from physical stock → moves to temp storage
-        await db.addStockAdjustment(
-          item.product_id,
-          -item.qty,
-          'customer_sales',
-          `Order ${newOrder.id} approved — moved to temp storage (${finalWhName})`,
-          actor,
-          finalWhId
-        );
+      // Automatically decide, per item, how much comes from the primary warehouse
+      // and how much (if any) needs to be combined in from other warehouses.
+      const { items: assignedItems } = await db.autoAssignWarehouses(orderItems, newOrder.id);
+
+      for (const item of assignedItems) {
+        const splitWh = item.split_warehouses;
+        if (splitWh && splitWh.length > 1) {
+          for (const portion of splitWh) {
+            if (portion.qty <= 0) continue;
+            await db.createReservation({
+              order_id: newOrder.id,
+              product_id: item.product_id,
+              warehouse_id: portion.warehouse_id,
+              qty: portion.qty,
+              status: 'active'
+            });
+            await db.addStockAdjustment(
+              item.product_id,
+              -portion.qty,
+              'customer_sales',
+              `Order ${newOrder.id} approved — moved to temp storage (${portion.warehouse_name})`,
+              actor,
+              portion.warehouse_id
+            );
+          }
+        } else {
+          const finalWhId = item.warehouse_id || primaryWh?.id || 'wh-main';
+          const finalWhName = item.warehouse_name || primaryWh?.name || 'Main Warehouse';
+          await db.createReservation({
+            order_id: newOrder.id,
+            product_id: item.product_id,
+            warehouse_id: finalWhId,
+            qty: item.qty,
+            status: 'active'
+          });
+          await db.addStockAdjustment(
+            item.product_id,
+            -item.qty,
+            'customer_sales',
+            `Order ${newOrder.id} approved — moved to temp storage (${finalWhName})`,
+            actor,
+            finalWhId
+          );
+        }
       }
-      const pickItems: PickListItem[] = orderItems.map(item => ({
+
+      // Persist the auto-assigned warehouse info onto the order's items so the
+      // UI can show exactly where stock came from (e.g. "Combined: Main x5 + Backup x3").
+      if (supabase) {
+        await supabase.from('orders').update({ items: assignedItems }).eq('id', newOrder.id);
+      } else {
+        const orders = getLocalTable<Order>('orders');
+        saveLocalTable('orders', orders.map(o => o.id === newOrder.id ? { ...o, items: assignedItems } : o));
+      }
+      newOrder.items = assignedItems;
+
+      const pickItems: PickListItem[] = assignedItems.map(item => ({
         product_id: item.product_id,
         name: item.name,
         qty: item.qty,
-        warehouse_id: item.warehouse_id || warehouseId || 'wh-main',
-        warehouse_name: item.warehouse_name || whName || 'Main Warehouse',
+        warehouse_id: item.warehouse_id || primaryWh?.id || 'wh-main',
+        warehouse_name: item.warehouse_name || primaryWh?.name || 'Main Warehouse',
         picked_qty: 0
       }));
       await db.createPickList(newOrder.id, pickItems);
@@ -995,81 +1049,34 @@ export const db = {
     const order = await db.getOrderById(orderId);
     if (!order) throw new Error('Order not found');
 
+    // Items with their warehouse assignment freshly computed (primary warehouse first,
+    // combined with overflow from other warehouses if the primary doesn't have enough).
+    // Computed once here and reused for both stock validation and the actual deduction
+    // below, so what we check is exactly what we apply.
+    let autoAssigned: OrderItem[] | null = null;
+
     // SECURE ORDER APPROVAL TRANSACTION (STOCK VALIDATION FIRST)
+    // NOTE: We bypass the approve_order_secure RPC entirely because it only checks
+    // the primary warehouse and does raw stock deduction without Math.max(0) guards,
+    // causing negative stock. All approval logic runs client-side via autoAssignWarehouses
+    // which correctly combines all warehouses and floors at 0.
     if (order.status === 'created' && newStatus === 'approved') {
-      if (supabase) {
-        try {
-          const { data, error } = await supabase.rpc('approve_order_secure', {
-            p_order_id: orderId,
-            p_actor_id: actor.id,
-            p_actor_name: actor.name,
-            p_actor_role: actor.role
+
+      // Client-side/LocalStorage Stock Validation.
+      // Automatically combine primary warehouse stock with overflow from other
+      // warehouses as needed — no manual warehouse choice required.
+      const { items: assigned, insufficientProductIds, availableQtyMap } = await db.autoAssignWarehouses(order.items, orderId);
+      autoAssigned = assigned;
+
+      if (insufficientProductIds.length > 0) {
+        const insufficientSet = new Set(insufficientProductIds);
+        const availableItems = order.items.filter(item => !insufficientSet.has(item.product_id));
+        const outOfStockItems = order.items
+          .filter(item => insufficientSet.has(item.product_id))
+          .map(item => {
+            const avail = availableQtyMap[item.product_id];
+            return { ...item, availableQty: (typeof avail === 'number' && avail > 0) ? avail : 0 };
           });
-
-          if (error) throw error;
-
-          if (data && !data.success) {
-            if (data.error === 'OUT_OF_STOCK') {
-              throw new OutOfStockError(
-                "Some products are out of stock.",
-                data.available_items || [],
-                data.out_of_stock_items || []
-              );
-            }
-            throw new Error(data.error || "Order approval failed");
-          }
-
-          const updatedFromDb = await db.getOrderById(orderId);
-          if (updatedFromDb) return updatedFromDb;
-        } catch (err) {
-          if (err instanceof OutOfStockError) throw err;
-          console.warn("Secure approval RPC failed or missing, falling back to client-side validation:", err);
-        }
-      }
-
-      // Client-side/LocalStorage Stock Validation
-      const warehouseStock = await db.getWarehouseStock();
-      const availableItems: OrderItem[] = [];
-      const outOfStockItems: OrderItem[] = [];
-
-      for (const item of order.items) {
-        const splitWh = (item as any).split_warehouses;
-        let isAvailable = true;
-
-        if (splitWh && splitWh.length > 1) {
-          for (const portion of splitWh) {
-            const wsRow = warehouseStock.find(ws => ws.warehouse_id === portion.warehouse_id && ws.product_id === item.product_id);
-            const stockQty = wsRow ? wsRow.qty : 0;
-            if (stockQty < portion.qty) {
-              isAvailable = false;
-            }
-          }
-        } else {
-          const finalWhId = (item as any).warehouse_id || order.warehouse_id;
-          let stockQty: number;
-          if (finalWhId) {
-            // Specific warehouse assigned — check only that warehouse
-            const wsRow = warehouseStock.find(ws => ws.warehouse_id === finalWhId && ws.product_id === item.product_id);
-            stockQty = wsRow ? wsRow.qty : 0;
-          } else {
-            // No warehouse assigned (e.g. customer orders) — sum across ALL warehouses
-            stockQty = warehouseStock
-              .filter(ws => ws.product_id === item.product_id)
-              .reduce((sum, ws) => sum + ws.qty, 0);
-          }
-          if (stockQty < item.qty) {
-            isAvailable = false;
-          }
-        }
-
-        if (isAvailable) {
-          availableItems.push(item);
-        } else {
-          outOfStockItems.push(item);
-        }
-      }
-
-      if (outOfStockItems.length > 0) {
         throw new OutOfStockError("Some products are out of stock.", availableItems, outOfStockItems);
       }
     }
@@ -1079,6 +1086,9 @@ export const db = {
 
     const updated = {
       ...order,
+      // Persist the auto-computed warehouse assignment onto the items (e.g. so the UI
+      // can show "Combined: Main x5 + Backup x3") when we just approved the order.
+      items: autoAssigned || order.items,
       status: newStatus,
       status_history: [
         ...order.status_history,
@@ -1103,13 +1113,14 @@ export const db = {
 
     await logAction(actor.id, actor.name, actor.role, `Updated Order ${orderId} Status to: ${newStatus}`);
 
-    if (order.status === 'created' && newStatus === 'approved') {
+    if (order.status === 'created' && newStatus === 'approved' && autoAssigned) {
       const pickItems: PickListItem[] = [];
-      for (const item of updated.items) {
-        const splitWh = (item as any).split_warehouses as { warehouse_id: string; warehouse_name: string; qty: number }[] | undefined;
+      for (const item of autoAssigned) {
+        const splitWh = item.split_warehouses;
 
         if (splitWh && splitWh.length > 1) {
-          // SPLIT: deduct each portion from its warehouse and create a reservation per portion
+          // Combined fulfillment: deduct each portion from its warehouse and
+          // create a reservation per portion.
           for (const portion of splitWh) {
             if (portion.qty <= 0) continue;
             await db.createReservation({
@@ -1132,20 +1143,13 @@ export const db = {
             product_id: item.product_id,
             name: item.name,
             qty: item.qty,
-            warehouse_id: (item as any).warehouse_id || order.warehouse_id || splitWh[0].warehouse_id,
-            warehouse_name: `Split: ${splitWh.map(p => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
+            warehouse_id: item.warehouse_id || splitWh[0].warehouse_id,
+            warehouse_name: `Combined: ${splitWh.map(p => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
             picked_qty: 0
           });
         } else {
-          // SINGLE warehouse — if no warehouse assigned, pick the one with most stock
-          let finalWhId = (item as any).warehouse_id || order.warehouse_id;
-          let finalWhName = (item as any).warehouse_name || order.warehouse_name;
-          if (!finalWhId) {
-            const warehouseStockForItem = (await db.getWarehouseStock()).filter(ws => ws.product_id === item.product_id && ws.qty > 0);
-            const bestWh = warehouseStockForItem.sort((a, b) => b.qty - a.qty)[0];
-            finalWhId = bestWh ? bestWh.warehouse_id : 'wh-main';
-            finalWhName = bestWh ? bestWh.warehouse_name : 'Main Warehouse';
-          }
+          const finalWhId = item.warehouse_id || 'wh-main';
+          const finalWhName = item.warehouse_name || 'Main Warehouse';
           await db.createReservation({
             order_id: orderId,
             product_id: item.product_id,
@@ -1171,9 +1175,13 @@ export const db = {
           });
         }
       }
-      await db.createPickList(orderId, pickItems);
+      // Guard: only create pick list if one doesn't already exist for this order
+      const existingPls = await db.getPickLists();
+      const alreadyHasPickList = existingPls.some(p => p.order_id === orderId);
+      if (!alreadyHasPickList) {
+        await db.createPickList(orderId, pickItems);
+      }
     }
-
 
     if (newStatus === 'packing') {
       const pls = await db.getPickLists();
@@ -1307,7 +1315,9 @@ export const db = {
 
     if (newStatus === 'delivered') {
       const customer = await db.getUserById(updated.customer_id);
-      if (customer && customer.role === 'customer') {
+      if (customer && customer.role === 'customer' && !updated.cod_tracking) {
+        // Only add to outstanding balance for credit/invoice orders.
+        // COD orders are paid at the door — no balance increase.
         const currentBalance = customer.outstanding_balance || 0;
         const newBalance = currentBalance + updated.total;
         
@@ -1372,6 +1382,48 @@ export const db = {
     await logAction(actor.id, actor.name, actor.role, `Assigned per-item warehouses for Order ${orderId}`);
   },
 
+  updateOrderItems: async (orderId: string, items: any[], actor: User): Promise<void> => {
+    const order = await db.getOrderById(orderId);
+    if (!order) throw new Error('Order not found');
+
+    // Recalculate order totals based on updated item quantities
+    const newSubtotal = Number(items.reduce((sum: number, item: any) => {
+      // Reconstruct subtotal from unit_price (which already has customer discount baked in)
+      // We need the original selling price — approximate from unit_price and discount ratio
+      // Safest: use item.total directly as the line total
+      return sum + Number((item.unit_price * item.qty).toFixed(2));
+    }, 0).toFixed(2));
+
+    // Preserve original discount proportionally
+    const originalRatio = order.subtotal > 0 ? order.discount / order.subtotal : 0;
+    const newDiscount = Number((newSubtotal * originalRatio).toFixed(2));
+    const afterDiscount = Number((newSubtotal - newDiscount).toFixed(2));
+    const manualPct = Number(((afterDiscount * (order.manual_discount_pct || 0)) / 100).toFixed(2));
+    const manualAmt = Number(Math.min(order.manual_discount_amt || 0, afterDiscount - manualPct).toFixed(2));
+    const newTotal = Number((afterDiscount - manualPct - manualAmt).toFixed(2));
+
+    // Update item totals to match recalculated unit_price * qty
+    const recalcItems = items.map((item: any) => ({
+      ...item,
+      total: Number((item.unit_price * item.qty).toFixed(2))
+    }));
+
+    const updates = {
+      items: recalcItems,
+      subtotal: newSubtotal,
+      discount: newDiscount,
+      total: Math.max(0, newTotal)
+    };
+
+    if (supabase) {
+      await supabase.from('orders').update(updates).eq('id', orderId);
+    } else {
+      const orders = getLocalTable<Order>('orders');
+      saveLocalTable('orders', orders.map(o => o.id === orderId ? { ...o, ...updates } : o));
+    }
+    await logAction(actor.id, actor.name, actor.role, `Updated items for Order ${orderId}`, `Partial fulfillment qty adjustment — new total: ${updates.total} SAR`);
+  },
+
   deleteOrder: async (id: string, actor: User): Promise<void> => {
     if (supabase) {
       await supabase.from('orders').update({ is_deleted: true, deleted_at: new Date().toISOString() }).eq('id', id);
@@ -1429,7 +1481,7 @@ export const db = {
     if (!customer) throw new Error('Customer not found');
 
     const currentBalance = customer.outstanding_balance || 0;
-    const newBalance = Number((currentBalance - amount).toFixed(2));
+    const newBalance = Number(Math.max(0, currentBalance - amount).toFixed(2));
 
     const entry: CustomerLedgerEntry = {
       id: `ldg-${Date.now()}`,
@@ -1524,14 +1576,15 @@ export const db = {
 
   // AUDIT LOGS
   getAuditLogs: async (actor: User): Promise<AuditLog[]> => {
+    const isFullAccess = ['admin', 'superowner'].includes(actor.role);
     if (supabase) {
       const query = supabase.from('audit_logs').select('*').order('timestamp', { ascending: false });
-      const { data, error } = actor.role === 'admin' ? await query : await query.eq('is_admin_only', false);
+      const { data, error } = isFullAccess ? await query : await query.eq('is_admin_only', false);
       if (error) throw error;
       return data || [];
     } else {
       const logs = getLocalTable<AuditLog>('audit_logs');
-      return actor.role === 'admin' ? logs : logs.filter(l => !l.is_admin_only);
+      return isFullAccess ? logs : logs.filter(l => !l.is_admin_only);
     }
   },
 
@@ -1578,7 +1631,7 @@ export const db = {
   },
 
   permanentlyDeleteTrashItem: async (id: string, type: 'product' | 'order' | 'user' | 'expense', actor: User): Promise<void> => {
-    if (actor.role !== 'admin') throw new Error('Only admins can permanently delete items.');
+    if (!['admin', 'superowner'].includes(actor.role)) throw new Error('Only admins and superowners can permanently delete items.');
     if (type === 'product') await db.permanentlyDeleteProduct(id, actor);
     else if (type === 'order') await db.permanentlyDeleteOrder(id, actor);
     else if (type === 'user') await db.permanentlyDeleteUser(id, actor);
@@ -1650,6 +1703,92 @@ export const db = {
     return getLocalTable<WarehouseStock>('warehouse_stock');
   },
 
+  // The PRIMARY warehouse is simply the oldest (first-created) active warehouse.
+  // Everything is fulfilled from here first; any extra warehouses are only used
+  // automatically as overflow when the primary doesn't have enough stock.
+  getPrimaryWarehouse: async (): Promise<Warehouse | undefined> => {
+    const whs = await db.getWarehouses();
+    if (whs.length === 0) return undefined;
+    return [...whs].sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime())[0];
+  },
+
+  // Decides where each order item's stock should come from, automatically:
+  // 1) Take as much as possible from the primary warehouse.
+  // 2) If that's not enough, pull the remainder from other warehouses (the ones
+  //    with the most free stock first) and combine them.
+  // Returns the items annotated with warehouse_id/warehouse_name (and split_warehouses
+  // when more than one warehouse was needed), plus a flag for any item that still
+  // can't be fully covered even after combining every warehouse.
+  autoAssignWarehouses: async (
+    items: OrderItem[],
+    excludeOrderId?: string
+  ): Promise<{ items: OrderItem[]; insufficientProductIds: string[]; availableQtyMap: Record<string, number> }> => {
+    const warehouses = await db.getWarehouses();
+    const primary = await db.getPrimaryWarehouse();
+    const warehouseStock = await db.getWarehouseStock();
+
+    const freeQty = (warehouseId: string, productId: string): number => {
+      const row = warehouseStock.find(ws => ws.warehouse_id === warehouseId && ws.product_id === productId);
+      return row ? Math.max(0, row.qty) : 0;
+    };
+
+    const insufficientProductIds: string[] = [];
+    const availableQtyMap: Record<string, number> = {}; // product_id → total available across all warehouses
+
+    const resolvedItems = items.map(item => {
+      const remainingWarehouses = warehouses
+        .filter(w => w.id !== primary?.id)
+        .map(w => ({ warehouse_id: w.id, warehouse_name: w.name, free: freeQty(w.id, item.product_id) }))
+        .sort((a, b) => b.free - a.free);
+
+      const portions: { warehouse_id: string; warehouse_name: string; qty: number }[] = [];
+      let stillNeeded = item.qty;
+
+      if (primary) {
+        const fromPrimary = Math.min(stillNeeded, freeQty(primary.id, item.product_id));
+        if (fromPrimary > 0) {
+          portions.push({ warehouse_id: primary.id, warehouse_name: primary.name, qty: fromPrimary });
+          stillNeeded -= fromPrimary;
+        }
+      }
+
+      for (const wh of remainingWarehouses) {
+        if (stillNeeded <= 0) break;
+        const take = Math.min(stillNeeded, wh.free);
+        if (take > 0) {
+          portions.push({ warehouse_id: wh.warehouse_id, warehouse_name: wh.warehouse_name, qty: take });
+          stillNeeded -= take;
+        }
+      }
+
+      if (stillNeeded > 0) {
+        insufficientProductIds.push(item.product_id);
+        // Track how much IS available (ordered qty minus shortfall)
+        availableQtyMap[item.product_id] = item.qty - stillNeeded;
+      }
+
+      if (portions.length === 0) {
+        // No stock anywhere — fall back to primary (or wh-main) so the rest of the
+        // pipeline has a warehouse to point at; OUT_OF_STOCK handling catches this.
+        const fallback = primary || { id: 'wh-main', name: 'Main Warehouse' };
+        return { ...item, warehouse_id: fallback.id, warehouse_name: fallback.name, split_warehouses: undefined };
+      }
+
+      if (portions.length === 1) {
+        return { ...item, warehouse_id: portions[0].warehouse_id, warehouse_name: portions[0].warehouse_name, split_warehouses: undefined };
+      }
+
+      return {
+        ...item,
+        warehouse_id: portions[0].warehouse_id,
+        warehouse_name: `Combined: ${portions.map(p => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
+        split_warehouses: portions
+      };
+    });
+
+    return { items: resolvedItems, insufficientProductIds, availableQtyMap };
+  },
+
   transferStock: async (productId: string, fromWarehouseId: string, toWarehouseId: string, qty: number, actor: User): Promise<void> => {
     const product = await db.getProductById(productId);
     if (!product) throw new Error('Product not found');
@@ -1658,11 +1797,19 @@ export const db = {
     const fromWh = whs.find(w => w.id === fromWarehouseId);
     const toWh = whs.find(w => w.id === toWarehouseId);
 
+    // Compute how much of fromWarehouse stock is already reserved (active reservations)
+    const allReservations = await db.getReservations();
+    const reservedInSource = allReservations
+      .filter(r => r.status === 'active' && r.product_id === productId && r.warehouse_id === fromWarehouseId)
+      .reduce((sum, r) => sum + r.qty, 0);
+
     if (supabase) {
-      // Check source stock
+      // Check source stock — only allow transferring freely-available (unreserved) qty
       const { data: fromRows } = await supabase.from('warehouse_stock').select('*').eq('warehouse_id', fromWarehouseId).eq('product_id', productId);
       const fromStock = fromRows?.[0];
-      if (!fromStock || fromStock.qty < qty) throw new Error(`Insufficient stock in source warehouse (available: ${fromStock?.qty ?? 0})`);
+      const physicalQty = fromStock?.qty ?? 0;
+      const freeQty = Math.max(0, physicalQty - reservedInSource);
+      if (!fromStock || freeQty < qty) throw new Error(`Insufficient free stock in source warehouse (physical: ${physicalQty}, reserved: ${reservedInSource}, available to transfer: ${freeQty})`);
 
       // Deduct from source
       await supabase.from('warehouse_stock').update({ qty: fromStock.qty - qty }).eq('warehouse_id', fromWarehouseId).eq('product_id', productId);
@@ -1684,7 +1831,9 @@ export const db = {
     } else {
       const whStockList = getLocalTable<WarehouseStock>('warehouse_stock');
       const fromStock = whStockList.find(ws => ws.warehouse_id === fromWarehouseId && ws.product_id === productId);
-      if (!fromStock || fromStock.qty < qty) throw new Error(`Insufficient stock in source warehouse (available: ${fromStock?.qty ?? 0})`);
+      const physicalQtyLocal = fromStock?.qty ?? 0;
+      const freeQtyLocal = Math.max(0, physicalQtyLocal - reservedInSource);
+      if (!fromStock || freeQtyLocal < qty) throw new Error(`Insufficient free stock in source warehouse (physical: ${physicalQtyLocal}, reserved: ${reservedInSource}, available to transfer: ${freeQtyLocal})`);
 
       // Deduct from source
       saveLocalTable('warehouse_stock', whStockList.map(ws =>
@@ -1960,7 +2109,7 @@ export const db = {
     outOfStockItems: OrderItem[],
     actor: User
   ): Promise<Order> => {
-    // If supabase is active and we want to perform this atomicly via RPC
+    // Try the Supabase RPC first — but verify it actually approved the order before trusting it
     if (supabase) {
       try {
         const { data, error } = await supabase.rpc('approve_order_partial_secure', {
@@ -1972,7 +2121,13 @@ export const db = {
           p_actor_role: actor.role
         });
         if (error) throw error;
-        return data;
+        // Re-fetch the order to confirm it was actually approved by the RPC
+        const verified = await db.getOrderById(orderId);
+        if (verified && verified.status === 'approved') {
+          return verified;
+        }
+        // RPC ran but didn't approve — fall through to client-side logic below
+        console.warn('approve_order_partial_secure RPC ran but order is still not approved — running client-side fallback');
       } catch (err) {
         console.warn("Secure partial approval RPC failed or missing, falling back to client-side database writes:", err);
       }
@@ -2013,6 +2168,10 @@ export const db = {
     const manualAmtDeduction = Number(Math.min(order.manual_discount_amt, afterCustomerDiscount - manualPctDeduction).toFixed(2));
     const total = Number((afterCustomerDiscount - (manualPctDeduction + manualAmtDeduction)).toFixed(2));
 
+    // Automatically decide, per item, how much comes from the primary warehouse
+    // and how much (if any) needs to be combined in from other warehouses.
+    const { items: assignedItems } = await db.autoAssignWarehouses(recalculatedItems, orderId);
+
     const removedSummary = outOfStockItems.map(i => `${i.name} ×${i.qty}`).join(', ');
     const historyEntry = {
       status: 'approved' as const,
@@ -2023,7 +2182,7 @@ export const db = {
 
     const updatedOrder: Order = {
       ...order,
-      items: recalculatedItems,
+      items: assignedItems,
       removed_items: outOfStockItems,
       subtotal,
       discount: totalDiscount,
@@ -2034,16 +2193,39 @@ export const db = {
     };
 
     if (supabase) {
-      await supabase.from('orders').update(updatedOrder).eq('id', orderId);
+      // Only send the fields that changed — avoids Supabase rejecting unknown/computed columns
+      const { error: updateErr } = await supabase.from('orders').update({
+        items: updatedOrder.items,
+        removed_items: updatedOrder.removed_items,
+        subtotal: updatedOrder.subtotal,
+        discount: updatedOrder.discount,
+        manual_discount_amt: updatedOrder.manual_discount_amt,
+        total: updatedOrder.total,
+        status: 'approved',
+        status_history: updatedOrder.status_history,
+      }).eq('id', orderId);
+      if (updateErr) throw new Error(`Failed to update order: ${updateErr.message}`);
     } else {
       const orders = getLocalTable<Order>('orders');
       saveLocalTable('orders', orders.map(o => o.id === orderId ? updatedOrder : o));
     }
 
     // Now perform stock adjustments and reservations for approved items
+    // Guard: before deducting, verify we haven't already created reservations for this order
+    // (prevents double-deduction if the Supabase RPC partially succeeded)
+    const existingReservations = await db.getReservations();
+    const alreadyReservedProductIds = new Set(
+      existingReservations
+        .filter(r => r.order_id === orderId && r.status === 'active')
+        .map(r => r.product_id)
+    );
+
     const pickItems: PickListItem[] = [];
-    for (const item of recalculatedItems) {
-      const splitWh = (item as any).split_warehouses;
+    for (const item of assignedItems) {
+      // Skip items that already have an active reservation (double-deduction guard)
+      if (alreadyReservedProductIds.has(item.product_id)) continue;
+
+      const splitWh = item.split_warehouses;
       if (splitWh && splitWh.length > 1) {
         for (const portion of splitWh) {
           if (portion.qty <= 0) continue;
@@ -2067,20 +2249,13 @@ export const db = {
           product_id: item.product_id,
           name: item.name,
           qty: item.qty,
-          warehouse_id: (item as any).warehouse_id || order.warehouse_id || splitWh[0].warehouse_id,
-          warehouse_name: `Split: ${splitWh.map((p: any) => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
+          warehouse_id: item.warehouse_id || splitWh[0].warehouse_id,
+          warehouse_name: `Combined: ${splitWh.map((p: any) => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`,
           picked_qty: 0
         });
       } else {
-        // SINGLE warehouse — if no warehouse assigned, pick the one with most stock
-        let finalWhId = (item as any).warehouse_id || order.warehouse_id;
-        let finalWhName = (item as any).warehouse_name || order.warehouse_name;
-        if (!finalWhId) {
-          const warehouseStockForItem = (await db.getWarehouseStock()).filter(ws => ws.product_id === item.product_id && ws.qty > 0);
-          const bestWh = warehouseStockForItem.sort((a, b) => b.qty - a.qty)[0];
-          finalWhId = bestWh ? bestWh.warehouse_id : 'wh-main';
-          finalWhName = bestWh ? bestWh.warehouse_name : 'Main Warehouse';
-        }
+        const finalWhId = item.warehouse_id || 'wh-main';
+        const finalWhName = item.warehouse_name || 'Main Warehouse';
         await db.createReservation({
           order_id: orderId,
           product_id: item.product_id,
@@ -2107,8 +2282,142 @@ export const db = {
       }
     }
 
-    await db.createPickList(orderId, pickItems);
+    // Guard: only create pick list if one doesn't already exist for this order
+    const existingPlsForPartial = await db.getPickLists();
+    if (!existingPlsForPartial.some(p => p.order_id === orderId)) {
+      await db.createPickList(orderId, pickItems);
+    }
     await logAction(actor.id, actor.name, actor.role, `Approved Order ${orderId} partially`, `Approved remaining total: ${total} SAR`);
+    return updatedOrder;
+  },
+
+  approveOrderWithAdjustedItems: async (
+    orderId: string,
+    adjustedItems: (OrderItem & { adjustedQty: number })[],
+    removedItems: OrderItem[],
+    actor: User
+  ): Promise<Order> => {
+    const order = await db.getOrderById(orderId);
+    if (!order) throw new Error('Order not found');
+
+    const customer = await db.getUserById(order.customer_id);
+    if (!customer) throw new Error('Customer not found');
+
+    // Build the final items list: items with adjustedQty > 0 (at new qty), items that are fully available unchanged
+    let subtotal = 0;
+    let totalDiscount = 0;
+    const recalculatedItems: OrderItem[] = [];
+
+    for (const item of adjustedItems) {
+      // adjustedQty is set for partial items; fully-available items won't have it — use their full qty
+      const qtyToUse = typeof (item as any).adjustedQty === 'number' ? (item as any).adjustedQty : item.qty;
+      if (qtyToUse <= 0) continue;
+      const prod = await db.getProductById(item.product_id);
+      if (!prod) throw new Error(`Product ${item.product_id} not found`);
+
+      const defaultPrice = prod.selling_price;
+      const finalPrice = db.calculateCustomerPrice(customer, prod);
+      const discountVal = defaultPrice - finalPrice;
+
+      const itemTotal = Number((finalPrice * qtyToUse).toFixed(2));
+      subtotal += Number((defaultPrice * qtyToUse).toFixed(2));
+      totalDiscount += Number((discountVal * qtyToUse).toFixed(2));
+
+      recalculatedItems.push({ ...item, qty: qtyToUse, unit_price: finalPrice, total: itemTotal });
+    }
+
+    const afterCustomerDiscount = Number((subtotal - totalDiscount).toFixed(2));
+    const manualPctDeduction = Number(((afterCustomerDiscount * order.manual_discount_pct) / 100).toFixed(2));
+    const manualAmtDeduction = Number(Math.min(order.manual_discount_amt, afterCustomerDiscount - manualPctDeduction).toFixed(2));
+    const total = Number((afterCustomerDiscount - (manualPctDeduction + manualAmtDeduction)).toFixed(2));
+
+    const { items: assignedItems } = await db.autoAssignWarehouses(recalculatedItems, orderId);
+
+    const adjustedSummary = adjustedItems
+      .filter(i => typeof (i as any).adjustedQty === 'number' && (i as any).adjustedQty < i.qty && (i as any).adjustedQty > 0)
+      .map(i => `${i.name} ×${i.qty}→×${(i as any).adjustedQty}`)
+      .join(', ');
+    const removedSummary = [...removedItems, ...adjustedItems.filter(i => typeof (i as any).adjustedQty === 'number' && (i as any).adjustedQty === 0)]
+      .map(i => `${i.name} ×${i.qty}`).join(', ');
+
+    const historyEntry = {
+      status: 'approved' as const,
+      updated_at: new Date().toISOString(),
+      updated_by_name: actor.name,
+      notes: [
+        adjustedSummary && `Qty adjusted: ${adjustedSummary}`,
+        removedSummary && `Removed: ${removedSummary}`
+      ].filter(Boolean).join('. ')
+    };
+
+    const allRemovedItems = [
+      ...removedItems,
+      ...adjustedItems.filter(i => typeof (i as any).adjustedQty === 'number' && (i as any).adjustedQty === 0).map(i => ({ ...i }))
+    ];
+
+    const updatedOrder: Order = {
+      ...order,
+      items: assignedItems,
+      removed_items: allRemovedItems,
+      subtotal,
+      discount: totalDiscount,
+      manual_discount_amt: manualAmtDeduction,
+      total,
+      status: 'approved',
+      status_history: [...order.status_history, historyEntry]
+    };
+
+    if (supabase) {
+      const { error: updateErr } = await supabase.from('orders').update({
+        items: updatedOrder.items,
+        removed_items: updatedOrder.removed_items,
+        subtotal: updatedOrder.subtotal,
+        discount: updatedOrder.discount,
+        manual_discount_amt: updatedOrder.manual_discount_amt,
+        total: updatedOrder.total,
+        status: 'approved',
+        status_history: updatedOrder.status_history,
+      }).eq('id', orderId);
+      if (updateErr) throw new Error(`Failed to update order: ${updateErr.message}`);
+    } else {
+      const orders = getLocalTable<Order>('orders');
+      saveLocalTable('orders', orders.map(o => o.id === orderId ? updatedOrder : o));
+    }
+
+    // Reserve stock for adjusted items
+    const existingReservations = await db.getReservations();
+    const alreadyReservedProductIds = new Set(
+      existingReservations
+        .filter(r => r.order_id === orderId && r.status === 'active')
+        .map(r => r.product_id)
+    );
+
+    const pickItems: PickListItem[] = [];
+    for (const item of assignedItems) {
+      if (alreadyReservedProductIds.has(item.product_id)) continue;
+
+      const splitWh = item.split_warehouses;
+      if (splitWh && splitWh.length > 1) {
+        for (const portion of splitWh) {
+          if (portion.qty <= 0) continue;
+          await db.createReservation({ order_id: orderId, product_id: item.product_id, warehouse_id: portion.warehouse_id, qty: portion.qty, status: 'active' });
+          await db.addStockAdjustment(item.product_id, -portion.qty, 'customer_sales', `Order ${orderId} approved (qty adjusted) — ${portion.warehouse_name}`, actor, portion.warehouse_id);
+        }
+        pickItems.push({ product_id: item.product_id, name: item.name, qty: item.qty, warehouse_id: item.warehouse_id || splitWh[0].warehouse_id, warehouse_name: `Combined: ${splitWh.map((p: any) => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`, picked_qty: 0 });
+      } else {
+        const finalWhId = item.warehouse_id || 'wh-main';
+        const finalWhName = item.warehouse_name || 'Main Warehouse';
+        await db.createReservation({ order_id: orderId, product_id: item.product_id, warehouse_id: finalWhId, qty: item.qty, status: 'active' });
+        await db.addStockAdjustment(item.product_id, -item.qty, 'customer_sales', `Order ${orderId} approved (qty adjusted) — ${finalWhName}`, actor, finalWhId);
+        pickItems.push({ product_id: item.product_id, name: item.name, qty: item.qty, warehouse_id: finalWhId, warehouse_name: finalWhName, picked_qty: 0 });
+      }
+    }
+
+    const existingPls = await db.getPickLists();
+    if (!existingPls.some(p => p.order_id === orderId)) {
+      await db.createPickList(orderId, pickItems);
+    }
+    await logAction(actor.id, actor.name, actor.role, `Approved Order ${orderId} with adjusted quantities`, `Total: ${total} SAR`);
     return updatedOrder;
   }
 };

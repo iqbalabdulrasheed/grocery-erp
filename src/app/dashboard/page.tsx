@@ -30,7 +30,8 @@ export default function DashboardPage() {
 
   // Out of Stock Dialog state
   const [showOutOfStockDialog, setShowOutOfStockDialog] = useState(false);
-  const [outOfStockDialogData, setOutOfStockDialogData] = useState<{ orderId: string; availableItems: any[]; outOfStockItems: any[] } | null>(null);
+  const [outOfStockDialogData, setOutOfStockDialogData] = useState<{ orderId: string; availableItems: any[]; outOfStockItems: any[]; partialItems: any[] } | null>(null);
+  const [adjustedQtys, setAdjustedQtys] = useState<Record<string, number>>({});
 
 
   // Owner Company Settings state
@@ -73,9 +74,6 @@ export default function DashboardPage() {
   const [showTransferModal, setShowTransferModal] = useState(false);
   const [transferForm, setTransferForm] = useState({ productId: '', fromWarehouseId: '', toWarehouseId: '', qty: 1 });
 
-  // Selected warehouse for order creation
-  const [selectedWarehouseId, setSelectedWarehouseId] = useState<string>('');
-
   // Stock filter by warehouse
   const [stockFilterWarehouse, setStockFilterWarehouse] = useState<string>('');
   const [notifications, setNotifications] = useState<{ id: string; text: string; time: string; type: string }[]>([]);
@@ -87,6 +85,7 @@ export default function DashboardPage() {
   const [productWarehouseId, setProductWarehouseId] = useState<string>("");
   const [isEditingProduct, setIsEditingProduct] = useState<string | null>(null);
   const [showProductModal, setShowProductModal] = useState(false);
+  const [editingProductOriginalStock, setEditingProductOriginalStock] = useState<number>(0);
 
   // Order Cart state (for customer / phone sales)
   const [cart, setCart] = useState<{ product_id: string; qty: number }[]>([]);
@@ -146,6 +145,16 @@ export default function DashboardPage() {
   const [orderFilterFrom, setOrderFilterFrom] = useState<string>('');
   const [orderFilterTo, setOrderFilterTo] = useState<string>('');
 
+  // Order History page filters + pagination
+  const [historyFilterStatus, setHistoryFilterStatus] = useState<string>('');
+  const [historyFilterType, setHistoryFilterType] = useState<string>('');
+  const [historyFilterFrom, setHistoryFilterFrom] = useState<string>('');
+  const [historyFilterTo, setHistoryFilterTo] = useState<string>('');
+  const [historyFilterCustomer, setHistoryFilterCustomer] = useState<string>('');
+  const [historySearchQuery, setHistorySearchQuery] = useState<string>('');
+  const [historyPage, setHistoryPage] = useState<number>(1);
+  const HISTORY_PAGE_SIZE = 25;
+
   // Accounts Ledger filters + pagination + expanded rows
   const [accountingSubTab, setAccountingSubTab] = useState<'expenses'|'ledger'>('expenses');
   const [ledgerFilterCustomer, setLedgerFilterCustomer] = useState<string>('');
@@ -192,11 +201,6 @@ export default function DashboardPage() {
     setOrderLoadingId(orderId);
     try { await fn(); } finally { setOrderLoadingId(null); actionLock.current = false; }
   }, []);
-
-  // Per-item warehouse selection: { [orderId]: { [productId]: warehouseId } }
-  const [itemWarehouseSelections, setItemWarehouseSelections] = React.useState<Record<string, Record<string, string>>>({});
-  // Per-item split qty for combined fulfillment: { [orderId]: { [productId]: { [warehouseId]: qty } } }
-  const [combinedSplitQty, setCombinedSplitQty] = React.useState<Record<string, Record<string, Record<string, number>>>>({});
 
   // Close any open modal on Escape key
   useEffect(() => {
@@ -291,12 +295,6 @@ export default function DashboardPage() {
     if (user.role === 'customer') {
       const cc = await db.getCustomerCompanyDetails(user.id);
       if (cc) setCustomerCompany(cc);
-    }
-
-    // Customers never get a warehouse pre-selected — they order against combined stock
-    const loggedInUser = auth.getCurrentUser();
-    if (!selectedWarehouseId && whs.length > 0 && loggedInUser?.role !== 'customer') {
-      setSelectedWarehouseId(whs[0].id);
     }
 
     // Generate smart contextual notifications
@@ -513,6 +511,7 @@ export default function DashboardPage() {
 
   const startEditProduct = (prod: Product) => {
     setIsEditingProduct(prod.id);
+    setEditingProductOriginalStock(prod.stock_qty);
     setProductForm(prod);
     // Pre-select the warehouse that already holds stock for this product (pick the one with most qty)
     const existing = warehouseStock.filter(ws => ws.product_id === prod.id);
@@ -626,7 +625,8 @@ export default function DashboardPage() {
 
     const stockInTypes: StockLedgerEntry['type'][] = ['purchase', 'supplier_return', 'customer_return'];
     const absQty = Math.abs(stockForm.qty);
-    const change = stockInTypes.includes(stockForm.type) ? absQty : -absQty;
+    // manual_adjustment: user enters signed value directly (negative to deduct, positive to add)
+    const change = stockForm.type === 'manual_adjustment' ? stockForm.qty : (stockInTypes.includes(stockForm.type) ? absQty : -absQty);
     const pid = stockForm.productId;
     const prod = products.find(p => p.id === pid);
 
@@ -691,7 +691,7 @@ export default function DashboardPage() {
       });
       setShowAssignModal(false);
       setAssignForm({ orderId: "", staffId: "", route: "" });
-      await reloadOrders();
+      await reloadOrdersAndStock();
     });
   };
 
@@ -745,22 +745,11 @@ export default function DashboardPage() {
   };
 
   // CART HANDLERS
-  // Returns the available qty for a product: per-warehouse if a warehouse is selected, else total
+  // Everyone orders against total combined stock across all warehouses.
+  // The system automatically pulls from the primary warehouse first, and combines
+  // in stock from other warehouses behind the scenes if the primary runs short —
+  // no warehouse choice needed at order time.
   const getAvailableQty = (prodId: string): number => {
-    const user = currentUser;
-    // Customers always order against total combined stock across all warehouses.
-    // Warehouse splitting is done by staff after approval — not at order time.
-    if (!user || user.role === 'customer') {
-      return Math.max(0, warehouseStock
-        .filter(ws => ws.product_id === prodId)
-        .reduce((sum, ws) => sum + ws.qty, 0));
-    }
-    // Staff/admin: respect selected warehouse if one is chosen
-    if (selectedWarehouseId) {
-      const wsRow = warehouseStock.find(ws => ws.warehouse_id === selectedWarehouseId && ws.product_id === prodId);
-      return Math.max(0, wsRow ? wsRow.qty : 0);
-    }
-    // No warehouse selected — sum all warehouses
     return Math.max(0, warehouseStock
       .filter(ws => ws.product_id === prodId)
       .reduce((sum, ws) => sum + ws.qty, 0));
@@ -771,13 +760,13 @@ export default function DashboardPage() {
     const existing = cart.find(c => c.product_id === prodId);
     if (existing) {
       if (existing.qty + 1 > maxQty) {
-        alert(`Cannot add more. Only ${maxQty} units available${selectedWarehouseId ? ' in the selected warehouse' : ''}.`);
+        alert(`Cannot add more. Only ${maxQty} units available.`);
         return;
       }
       setCart(cart.map(c => c.product_id === prodId ? { ...c, qty: c.qty + 1 } : c));
     } else {
       if (maxQty <= 0) {
-        alert(`No stock available${selectedWarehouseId ? ' in the selected warehouse' : ''}.`);
+        alert(`No stock available.`);
         return;
       }
       setCart([...cart, { product_id: prodId, qty: 1 }]);
@@ -795,7 +784,7 @@ export default function DashboardPage() {
     }
     const maxQty = getAvailableQty(prodId);
     if (val > maxQty) {
-      alert(`Exceeds available inventory${selectedWarehouseId ? ' in the selected warehouse' : ''} (${maxQty} units).`);
+      alert(`Exceeds available inventory (${maxQty} units).`);
       return;
     }
     setCart(cart.map(c => c.product_id === prodId ? { ...c, qty: val } : c));
@@ -809,25 +798,44 @@ export default function DashboardPage() {
       return;
     }
 
-    // Compute totals optimistically
+    // Compute totals optimistically — mirrors db.calculateCustomerPrice logic exactly
     const customer = usersList.find(u => u.id === customerId);
-    const customerDiscount = customer?.customer_discount || 0;
     const items = cart.map(c => {
       const p = products.find(pr => pr.id === c.product_id)!;
-      const unitPrice = (customer?.custom_pricing?.[c.product_id]) ?? p?.selling_price ?? 0;
-      const discountedPrice = unitPrice * (1 - customerDiscount / 100);
+      const sellingPrice = p?.selling_price ?? 0;
+      let unitPrice: number;
+      if (customer?.custom_pricing?.[c.product_id] !== undefined) {
+        // Custom price takes precedence — no additional discount stacked on top
+        unitPrice = customer.custom_pricing[c.product_id];
+      } else if (customer?.customer_discount && customer.customer_discount > 0) {
+        unitPrice = Number((sellingPrice * (1 - customer.customer_discount / 100)).toFixed(2));
+      } else {
+        unitPrice = sellingPrice;
+      }
       return {
         product_id: c.product_id,
         name: p?.name || c.product_id,
         qty: c.qty,
-        unit_price: discountedPrice,
-        total: discountedPrice * c.qty,
+        unit_price: unitPrice,
+        total: Number((unitPrice * c.qty).toFixed(2)),
       };
     });
     const subtotal = items.reduce((s, i) => s + i.total, 0);
     const discountAmt = subtotal * (manualDiscountPct / 100) + manualDiscountAmt;
     const total = Math.max(0, subtotal - discountAmt);
     const tempOrderId = `ord-${Date.now()}`;
+
+    // Capture snapshot BEFORE clearing cart — cart.slice() after clear is always []
+    const cartSnapshot = cart.slice();
+
+    // Determine status — auto-approving roles skip the 'created' state
+    const isApprovedImmediately = ['admin', 'superowner', 'owner', 'manager', 'warehouse_manager'].includes(currentUser.role);
+    const tempStatus: Order['status'] = isApprovedImmediately ? 'approved' : 'created';
+
+    // Primary warehouse is fulfilled from first automatically; only used here for an
+    // optimistic preview before the real order (with its final combined breakdown) comes back.
+    const primaryWh = warehouses[0];
+
     const tempOrder: Order = {
       id: tempOrderId,
       customer_id: customerId,
@@ -836,7 +844,7 @@ export default function DashboardPage() {
       created_by_name: currentUser!.name,
       created_at: new Date().toISOString(),
       type: selectedOrderType,
-      status: 'created',
+      status: tempStatus,
       items,
       subtotal,
       discount: discountAmt,
@@ -844,18 +852,18 @@ export default function DashboardPage() {
       manual_discount_amt: manualDiscountAmt,
       total,
       cod_tracking: isCodOrder,
-      warehouse_id: selectedWarehouseId || undefined,
+      warehouse_id: primaryWh?.id,
+      warehouse_name: primaryWh?.name,
       status_history: [{ status: 'created', updated_at: new Date().toISOString(), updated_by_name: currentUser!.name }],
     };
 
     // Optimistic: reserve stock and add order immediately
-    const isApprovedImmediately = ['admin', 'superowner', 'owner', 'manager'].includes(currentUser.role);
     if (isApprovedImmediately) {
       const tempResList: StockReservation[] = cart.map(c => ({
         id: `res-temp-${Date.now()}-${c.product_id}`,
         order_id: tempOrderId,
         product_id: c.product_id,
-        warehouse_id: selectedWarehouseId || 'wh-main',
+        warehouse_id: primaryWh?.id || 'wh-main',
         qty: c.qty,
         status: 'active',
         created_at: new Date().toISOString()
@@ -871,8 +879,7 @@ export default function DashboardPage() {
     setShowOrderSuccess(true);
 
     try {
-      const orderWarehouseId = currentUser!.role === 'customer' ? undefined : (selectedWarehouseId || undefined);
-      const newOrder = await db.createOrder(customerId, cart.slice(), selectedOrderType, isCodOrder, currentUser!, manualDiscountPct, manualDiscountAmt, orderWarehouseId);
+      const newOrder = await db.createOrder(customerId, cartSnapshot, selectedOrderType, isCodOrder, currentUser!, manualDiscountPct, manualDiscountAmt);
       // Replace temp order with real one
       if (newOrder) {
         setOrders(prev => prev.map(o => o.id === tempOrderId ? newOrder : o));
@@ -1160,64 +1167,60 @@ export default function DashboardPage() {
     setReturnWarehouseModal(null);
     setReturningOrderId(order.id);
     try {
-      for (const item of order.items) {
-        // SINGLE-WAREHOUSE MODE: order came back from delivery — user chose one warehouse for all items
-        if (isSingleMode && chosenWarehouseId) {
+      // CRITICAL: Only restore items that have reservations — these are the items
+      // that were actually deducted from stock. For partially-approved orders, some items
+      // may never have been approved/deducted, so restoring them would create phantom stock.
+      //
+      // Reservation status depends on how far the order got:
+      //   - cancelled before out_for_delivery → reservations are still 'active'
+      //   - cancelled from out_for_delivery → reservations were marked 'completed' at dispatch
+      const wasOutForDelivery = order.status_history?.some((h: any) => h.status === 'out_for_delivery');
+      const allReservations = await db.getReservations();
+      const relevantReservations = allReservations.filter(
+        r => r.order_id === order.id &&
+          (wasOutForDelivery ? r.status === 'completed' : r.status === 'active')
+      );
+
+      if (isSingleMode && chosenWarehouseId) {
+        // SINGLE-WAREHOUSE MODE: order came back from delivery — user chose one warehouse for all items.
+        for (const res of relevantReservations) {
           await db.addStockAdjustment(
-            item.product_id,
-            item.qty,
+            res.product_id,
+            res.qty,
             'customer_return',
             `Return - Cancelled Order ${order.id} (returned from delivery)`,
             currentUser!,
             chosenWarehouseId
           );
-          continue;
+          await db.updateReservationStatus(res.id, 'cancelled');
         }
-        const splitWh = (item as any).split_warehouses as { warehouse_id: string; warehouse_name: string; qty: number }[] | undefined;
-        if (splitWh && splitWh.length > 1) {
-          // Split order — return each portion to its original warehouse
-          for (const portion of splitWh) {
-            if (portion.qty <= 0) continue;
-            await db.addStockAdjustment(
-              item.product_id,
-              portion.qty,
-              'customer_return',
-              `Return - Cancelled Order ${order.id} (${portion.warehouse_name})`,
-              currentUser!,
-              portion.warehouse_id
-            );
-          }
-        } else {
-          const manualWhId = returnItemWarehouses[item.product_id] || (item as any).warehouse_id || undefined;
-          if (manualWhId) {
-            // Single warehouse explicitly known — return directly
-            await db.addStockAdjustment(item.product_id, item.qty, 'customer_return', `Return - Cancelled Order ${order.id}`, currentUser!, manualWhId);
-          } else {
-          // Auto-split order: look up the dispatch ledger entries to return stock
-          // to the exact same warehouses it was taken from
-          const ledger = await db.getStockLedger();
-          const dispatchEntries = ledger.filter(e =>
-            e.product_id === item.product_id &&
-            e.type === 'dispatch' &&
-            e.notes?.includes(order.id) &&
-            e.warehouse_id
-          );
-          if (dispatchEntries.length > 0) {
-            for (const entry of dispatchEntries) {
+      } else {
+        // PER-ITEM MODE: return each reservation's qty to its exact source warehouse.
+        for (const res of relevantReservations) {
+          const item = order.items.find((i: any) => i.product_id === res.product_id);
+          const splitWh = (item as any)?.split_warehouses as { warehouse_id: string; warehouse_name: string; qty: number }[] | undefined;
+
+          if (splitWh && splitWh.length > 1) {
+            for (const portion of splitWh) {
+              if (portion.qty <= 0) continue;
               await db.addStockAdjustment(
-                item.product_id,
-                Math.abs(entry.qty_change),
+                res.product_id,
+                portion.qty,
                 'customer_return',
-                `Return - Cancelled Order ${order.id} (auto-split reversal)`,
+                `Return - Cancelled Order ${order.id} (${portion.warehouse_name})`,
                 currentUser!,
-                entry.warehouse_id
+                portion.warehouse_id
               );
             }
           } else {
-            // Fallback: no ledger trace found, return without warehouse (whole-stock adjust)
-            await db.addStockAdjustment(item.product_id, item.qty, 'customer_return', `Return - Cancelled Order ${order.id}`, currentUser!);
+            const targetWarehouseId = res.warehouse_id || returnItemWarehouses[res.product_id] || undefined;
+            if (targetWarehouseId) {
+              await db.addStockAdjustment(res.product_id, res.qty, 'customer_return', `Return - Cancelled Order ${order.id}`, currentUser!, targetWarehouseId);
+            } else {
+              await db.addStockAdjustment(res.product_id, res.qty, 'customer_return', `Return - Cancelled Order ${order.id}`, currentUser!);
             }
           }
+          await db.updateReservationStatus(res.id, 'cancelled');
         }
       }
       const restoredEntry = { status: 'failed' as const, updated_at: new Date().toISOString(), updated_by_name: `STOCK_RESTORED:${currentUser!.name}` };
@@ -1400,7 +1403,7 @@ export default function DashboardPage() {
           </button>
 
            {/* B2B Customer Pricing / Catalog */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff', 'customer'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff', 'customer'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("products"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1415,7 +1418,7 @@ export default function DashboardPage() {
           )}
 
           {/* Stock adjustments & ledgers */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("inventory"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1447,8 +1450,23 @@ export default function DashboardPage() {
           </button>
           )}
 
+          {/* Order History — delivered & cancelled */}
+          {currentUser.role !== 'accountant' && (
+            <button
+              onClick={() => { setActiveTab("order-history"); setSidebarOpen(false); }}
+              className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
+                activeTab === "order-history"
+                  ? "bg-blue-600 text-white shadow-lg shadow-blue-600/20"
+                  : "text-slate-600 dark:text-gray-400 hover:bg-slate-200 dark:hover:bg-white/5 hover:text-slate-900 dark:hover:text-white"
+              }`}
+            >
+              <History className="w-4 h-4" />
+              Order History
+            </button>
+          )}
+
           {/* Cancelled Orders Returns */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("returns"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1459,14 +1477,18 @@ export default function DashboardPage() {
             >
               <Undo2 className="w-4 h-4" />
               Cancelled Returns
-              {orders.filter(o => o.status === 'failed' && !o.status_history?.some((h: any) => h.updated_by_name?.startsWith('STOCK_RESTORED:'))).length > 0 && (
+              {orders.filter(o =>
+                o.status === 'failed' &&
+                !o.status_history?.some((h: any) => h.updated_by_name?.startsWith('STOCK_RESTORED:')) &&
+                o.status_history?.some((h: any) => ['approved','packing','assigned','out_for_delivery'].includes(h.status))
+              ).length > 0 && (
                 <span className="ml-auto w-2.5 h-2.5 rounded-full bg-red-500 flex-shrink-0" />
               )}
             </button>
           )}
 
           {/* Accounting Expense/Ledger */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff', 'accountant'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("accounting"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1481,7 +1503,7 @@ export default function DashboardPage() {
           )}
 
           {/* Users Creation RBAC */}
-          {['admin', 'superowner', 'owner', 'manager'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("users"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1511,7 +1533,7 @@ export default function DashboardPage() {
           )}
 
           {/* Warehouses Management */}
-          {['admin', 'owner', 'manager'].includes(currentUser.role) && (
+          {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("warehouses"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1526,7 +1548,7 @@ export default function DashboardPage() {
           )}
 
           {/* Soft Deleted Trash Recovery */}
-          {['admin', 'superowner', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
             <button
               onClick={() => { setActiveTab("trash"); setSidebarOpen(false); }}
               className={`w-full flex items-center gap-3 px-4 py-2.5 rounded-lg text-xs font-bold transition duration-200 cursor-pointer ${
@@ -1849,7 +1871,7 @@ export default function DashboardPage() {
               </div>
 
               {/* ANALYTICS CHARTS */}
-              {['admin', 'superowner', 'owner', 'manager'].includes(currentUser.role) && (
+              {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager'].includes(currentUser.role) && (
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 print:hidden">
                   <div className="lg:col-span-2 glass-panel rounded-xl p-5 border border-slate-200 dark:border-white/5">
                     <h3 className="text-xs font-bold text-slate-900 dark:text-white uppercase tracking-wider mb-5 flex items-center gap-1.5">
@@ -1932,7 +1954,7 @@ export default function DashboardPage() {
                             <span className="inline-block px-2.5 py-0.5 rounded-full font-bold bg-red-100 dark:bg-red-950/40 border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-[10px]">
                               {p.stock_qty} left
                             </span>
-                            {['admin', 'owner', 'manager', 'staff'].includes(currentUser?.role) && (
+                            {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser?.role) && (
                               <p className="text-[9px] text-blue-500 dark:text-blue-400 mt-1 underline cursor-pointer" onClick={() => {
                                 setStockForm({ ...stockForm, productId: p.id, qty: p.min_stock * 2, type: 'purchase' });
                                 setShowStockModal(true);
@@ -2034,7 +2056,7 @@ export default function DashboardPage() {
                     />
                   </div>
                   
-                  {['admin', 'owner', 'manager'].includes(currentUser.role) && (
+                  {['admin', 'owner', 'manager', 'warehouse_manager'].includes(currentUser.role) && (
                     <button
                       onClick={() => {
                         setIsEditingProduct(null);
@@ -2104,9 +2126,9 @@ export default function DashboardPage() {
                       <th className="p-4">SKU / Barcode</th>
                       <th className="p-4">Category</th>
                       <th className="p-4">Stock Qty</th>
-                      {['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser?.role) && <th className="p-4">Purchase Cost</th>}
+                      {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'accountant'].includes(currentUser?.role) && <th className="p-4">Purchase Cost</th>}
                       <th className="p-4">Selling Price</th>
-                      {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                      {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                         <th className="p-4 text-right">Actions</th>
                       )}
                     </tr>
@@ -2130,8 +2152,8 @@ export default function DashboardPage() {
                             <span className={`inline-block px-2.5 py-0.5 rounded-full font-bold ${isLowStock ? 'bg-red-100 dark:bg-red-950/40 border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400' : 'bg-green-100 dark:bg-green-950/40 border border-green-200 dark:border-green-500/20 text-green-600 dark:text-green-400'}`}>
                               {p.stock_qty} {p.unit}
                             </span>
-                            {/* Warehouse breakdown — admin/owner/manager only, show all warehouses */}
-                            {['admin', 'superowner', 'owner', 'manager'].includes(currentUser.role) && warehouses.length > 1 && (() => {
+                            {/* Warehouse breakdown — show all warehouses */}
+                            {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (() => {
                               const breakdown = warehouseStock.filter(ws => ws.product_id === p.id);
                               if (breakdown.length === 0) return null;
                               return (
@@ -2145,7 +2167,7 @@ export default function DashboardPage() {
                               );
                             })()}
                           </td>
-                          {['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser?.role) && (
+                          {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'accountant'].includes(currentUser?.role) && (
                             <td className="p-4 font-bold text-slate-900 dark:text-white">{formatSAR(p.purchase_cost)}</td>
                           )}
                           <td className="p-4">
@@ -2162,7 +2184,7 @@ export default function DashboardPage() {
                               return <span className="text-blue-600 dark:text-blue-400 font-bold">{formatSAR(p.selling_price)}</span>;
                             })()}
                           </td>
-                          {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                          {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                             <td className="p-4 text-right space-x-2">
                               <button 
                                 onClick={() => startEditProduct(p)}
@@ -2248,7 +2270,7 @@ export default function DashboardPage() {
                   <p className="text-xs text-slate-500 dark:text-gray-400">Complete traceability log of every single box, packet, and bag moving in or out of the warehouse.</p>
                 </div>
                 <div className="flex gap-2 shrink-0">
-                  {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                  {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                     <button
                       onClick={() => {
                         setStockForm({ productId: products[0]?.id || "", qty: 0, type: "purchase", notes: "", warehouseId: "" });
@@ -2412,7 +2434,7 @@ export default function DashboardPage() {
             );
           })()}
 
-          {/* TAB 4: ORDERS */}
+{/* TAB 4: ORDERS — Kanban pipeline */}
           {activeTab === "orders" && (() => {
             const ORDER_STATUS_RANK: Record<string, number> = {
               created: 0, approved: 1, packing: 2, assigned: 3, out_for_delivery: 4, delivered: 5, failed: 6
@@ -2420,8 +2442,8 @@ export default function DashboardPage() {
 
             const filteredAndSortedOrders = orders
               .filter(o => {
+                if (['delivered', 'failed'].includes(o.status)) return false; // moved to Order History
                 if (currentUser?.role === 'customer' && o.customer_id !== currentUser?.id) return false;
-                // Delivery staff only see orders assigned to them
                 if (currentUser?.role === 'delivery' && o.assigned_staff_id !== currentUser?.id) return false;
                 if (orderFilterStatus && o.status !== orderFilterStatus) return false;
                 if (orderFilterType && o.type !== orderFilterType) return false;
@@ -2444,14 +2466,40 @@ export default function DashboardPage() {
             const orderTypes = Array.from(new Set(orders.map(o => o.type)));
             const activeCount = orders.filter(o => !['delivered', 'failed'].includes(o.status) && (currentUser?.role !== 'customer' || o.customer_id === currentUser?.id)).length;
 
+            // Kanban columns definition — maps DB status values to display stages
+            const KANBAN_COLUMNS = [
+              { key: 'created',          label: 'Pending Approval', color: 'amber' },
+              { key: 'approved',         label: 'Approved',         color: 'blue' },
+              { key: 'packing',          label: 'Packing',          color: 'purple' },
+              { key: 'assigned',         label: 'Driver Assigned',  color: 'indigo' },
+              { key: 'out_for_delivery', label: 'Out for Delivery', color: 'teal' },
+            ] as const;
+
+            // Color maps for column headers and card accents
+            const colColors: Record<string, { header: string; badge: string; dot: string }> = {
+              amber:   { header: 'bg-amber-50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-500/20 text-amber-700 dark:text-amber-400',   badge: 'bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400 border-amber-200 dark:border-amber-500/20',   dot: 'bg-amber-400' },
+              blue:    { header: 'bg-blue-50 dark:bg-blue-950/20 border-blue-200 dark:border-blue-500/20 text-blue-700 dark:text-blue-400',         badge: 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20',         dot: 'bg-blue-400' },
+              purple:  { header: 'bg-purple-50 dark:bg-purple-950/20 border-purple-200 dark:border-purple-500/20 text-purple-700 dark:text-purple-400', badge: 'bg-purple-100 dark:bg-purple-950/40 text-purple-700 dark:text-purple-400 border-purple-200 dark:border-purple-500/20', dot: 'bg-purple-400' },
+              indigo:  { header: 'bg-indigo-50 dark:bg-indigo-950/20 border-indigo-200 dark:border-indigo-500/20 text-indigo-700 dark:text-indigo-400', badge: 'bg-indigo-100 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-400 border-indigo-200 dark:border-indigo-500/20', dot: 'bg-indigo-400' },
+              teal:    { header: 'bg-teal-50 dark:bg-teal-950/20 border-teal-200 dark:border-teal-500/20 text-teal-700 dark:text-teal-400',         badge: 'bg-teal-100 dark:bg-teal-950/40 text-teal-700 dark:text-teal-400 border-teal-200 dark:border-teal-500/20',         dot: 'bg-teal-400' },
+              emerald: { header: 'bg-emerald-50 dark:bg-emerald-950/20 border-emerald-200 dark:border-emerald-500/20 text-emerald-700 dark:text-emerald-400', badge: 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border-emerald-200 dark:border-emerald-500/20', dot: 'bg-emerald-400' },
+            };
+
+            // Age in days from created_at
+            const orderAgeDays = (order: Order) => {
+              const ms = Date.now() - new Date(order.created_at).getTime();
+              return Math.floor(ms / 86400000);
+            };
+
             return (
             <div className="space-y-6">
+              {/* ── Header ── */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
-                  <h2 className="text-xl font-bold text-slate-950 dark:text-white">Orders & Delivery System</h2>
-                  <p className="text-xs text-slate-500 dark:text-gray-400">Order dispatch control. Approve sales, assign delivery drivers (staff), and tracking status in real time.</p>
+                  <h2 className="text-xl font-bold text-slate-950 dark:text-white">Orders Pipeline</h2>
+                  <p className="text-xs text-slate-500 dark:text-gray-400">Each column is one stage. Each card shows one action.</p>
                 </div>
-                <div className="flex gap-2 shrink-0">
+                <div className="flex gap-2 shrink-0 flex-wrap">
                   <div className="relative">
                     <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
                     <input
@@ -2468,13 +2516,12 @@ export default function DashboardPage() {
                         setCart([]);
                         setSelectedCustomerId(usersList.find(u => u.role === 'customer')?.id || "");
                         setActiveTab("create-order");
-                        // Refresh stock immediately so customer sees live counts
                         reloadTabData("create-order").catch(() => {});
                       }}
                       className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-bold text-white cursor-pointer"
                     >
                       <Plus className="w-3.5 h-3.5" />
-                      New Order Form
+                      New Order
                     </button>
                   )}
                   <button
@@ -2482,24 +2529,22 @@ export default function DashboardPage() {
                     className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-bold text-slate-700 dark:text-gray-300 cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    Excel Orders
+                    Export
                   </button>
                 </div>
               </div>
 
-              {/* ORDER FILTERS */}
+              {/* ── Filters ── */}
               <div className="flex flex-wrap items-end gap-3 p-4 rounded-xl bg-white dark:bg-white/3 border border-slate-200 dark:border-white/5">
                 <div className="flex flex-col gap-1 min-w-[140px]">
-                  <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Status</label>
+                  <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Stage</label>
                   <select value={orderFilterStatus} onChange={e => setOrderFilterStatus(e.target.value)} className="glass-input px-2.5 py-1.5 rounded-lg text-xs">
-                    <option value="">All Statuses</option>
-                    <option value="created">Created (Pending)</option>
+                    <option value="">All Stages</option>
+                    <option value="created">Pending Approval</option>
                     <option value="approved">Approved</option>
                     <option value="packing">Packing</option>
-                    <option value="assigned">Assigned</option>
+                    <option value="assigned">Driver Assigned</option>
                     <option value="out_for_delivery">Out for Delivery</option>
-                    <option value="delivered">Delivered</option>
-                    <option value="failed">Cancelled / Failed</option>
                   </select>
                 </div>
                 <div className="flex flex-col gap-1 min-w-[130px]">
@@ -2532,632 +2577,703 @@ export default function DashboardPage() {
                       {activeCount} active
                     </span>
                   )}
-                  <span className="text-[10px] text-slate-400 dark:text-gray-500 italic">Sorted: active first</span>
                 </div>
               </div>
 
-              {/* ORDERS LIST */}
-              <div className="space-y-4">
-                {filteredAndSortedOrders.length === 0 ? (
-                  <div className="glass-panel rounded-xl p-8 text-center text-slate-400 dark:text-gray-500 border border-slate-200 dark:border-white/5">No orders match the selected filters</div>
-                ) : filteredAndSortedOrders.map(order => {
-                  const currentStatus = order.status;
-                  const isThisOrderLoading = orderLoadingId === order.id;
-
-                  // Per-item warehouse analysis
-                  const fulfillmentInfo = (() => {
-                    if (warehouses.length === 0) return null;
-                    // Order-level warehouse fallback (set at cart time or auto-resolved)
-                    const orderWarehouseId = (order as any).warehouse_id;
-                    const orderWarehouseName = (order as any).warehouse_name;
-                    const currentSelections = itemWarehouseSelections[order.id] || {};
-                    const currentSplits = combinedSplitQty[order.id] || {};
-
-                    // itemChecks: for every item, list warehouses with enough stock and those with partial
-                    const itemChecks = order.items.map((item: any) => {
-                      // Since stock is physically deducted from warehouse_stock at order approval,
-                      // the qty in warehouse_stock is already the TRUE available qty.
-                      // We must NOT subtract reservations again — that would double-count.
-                      // Only subtract reservations from OTHER orders that haven't been approved yet
-                      // (status === 'created') since their stock hasn't been deducted yet.
-                      const stockRows = warehouseStock.filter((ws: any) => ws.product_id === item.product_id).map((ws: any) => {
-                        const reservedByCreatedOrders = stockReservations
-                          .filter((r: any) =>
-                            r.product_id === item.product_id &&
-                            r.warehouse_id === ws.warehouse_id &&
-                            r.status === 'active' &&
-                            r.order_id !== order.id
-                          )
-                          .reduce((sum: number, r: any) => {
-                            // Only subtract if the related order is still 'created' (not yet approved/deducted)
-                            const relatedOrder = orders.find((o: any) => o.id === r.order_id);
-                            return relatedOrder?.status === 'created' ? sum + r.qty : sum;
-                          }, 0);
-                        return { ...ws, qty: Math.max(0, ws.qty - reservedByCreatedOrders) };
-                      });
-                      const sufficient = stockRows.filter((ws: any) => ws.qty >= item.qty);
-                      const partial = stockRows.filter((ws: any) => ws.qty > 0 && ws.qty < item.qty);
-                      const totalQty = stockRows.reduce((s: number, ws: any) => s + ws.qty, 0);
-                      // Combined: no single warehouse has enough but together they do
-                      const combinedSufficient = sufficient.length === 0 && totalQty >= item.qty;
-
-                      // For approved/in-progress orders: stock was already physically deducted at approval.
-                      // Use the active reservations for THIS order to show what was actually allocated.
-                      const isApproved = ['approved','packing','assigned','out_for_delivery'].includes(order.status);
-                      const thisOrderReservations = stockReservations.filter((r: any) =>
-                        r.order_id === order.id &&
-                        r.product_id === item.product_id &&
-                        r.status === 'active'
-                      );
-                      const reservedWh = thisOrderReservations.length > 0
-                        ? thisOrderReservations.map((r: any) => ({
-                            warehouse_id: r.warehouse_id,
-                            warehouse_name: warehouses.find((w: any) => w.id === r.warehouse_id)?.name || r.warehouse_id,
-                            qty: r.qty
-                          }))
-                        : null;
-
-                      // Saved warehouse: item-level first, then fall back to order-level
-                      const whId = item.warehouse_id || orderWarehouseId;
-                      const whName = item.warehouse_name || orderWarehouseName;
-                      const savedWh = whId ? { id: whId, name: whName } : null;
-                      // Check if combined split is confirmed by user (all partial warehouses have qty assigned that sum to item.qty)
-                      const splitMap = currentSplits[item.product_id] || {};
-                      const splitTotal = Object.values(splitMap).reduce((s: number, q: any) => s + (q || 0), 0);
-                      const splitConfirmed = combinedSufficient && splitTotal === item.qty && Object.keys(splitMap).length > 0;
-                      return { product_id: item.product_id, name: item.name, qty: item.qty, sufficient, partial, savedWh, totalQty, combinedSufficient, splitMap, splitTotal, splitConfirmed, reservedWh, isApproved };
-                    });
-
-                    // Items that still need a decision (multiple choices OR combined-split not yet confirmed)
-                    const pendingChoices = itemChecks.filter((ic: any) => {
-                      const sel = currentSelections[ic.product_id];
-                      if (ic.savedWh) return false; // already saved in DB
-                      if (ic.sufficient.length === 1) return false; // auto-resolved
-                      if (ic.sufficient.length > 1 && !sel) return true; // multiple warehouses, not chosen
-                      if (ic.combinedSufficient && !ic.splitConfirmed) return true; // split needed
-                      return false;
-                    });
-
-                    // Items already decided (saved on item) or with only one option
-                    const resolved = itemChecks.map((ic: any) => {
-                      const sel = currentSelections[ic.product_id];
-                      if (sel) return { ...ic, chosenId: sel };
-                      if (ic.savedWh) return { ...ic, chosenId: ic.savedWh.id };
-                      if (ic.sufficient.length === 1) return { ...ic, chosenId: ic.sufficient[0].warehouse_id };
-                      // Combined & split confirmed: treat as resolved with combined marker
-                      if (ic.combinedSufficient && ic.splitConfirmed) return { ...ic, chosenId: 'combined' };
-                      return { ...ic, chosenId: null };
-                    });
-
-                    // Group resolved items by warehouse for the driver summary
-                    const byWarehouse: Record<string, { name: string; items: { itemName: string; qty: number }[] }> = {};
-                    for (const r of resolved) {
-                      if (!r.chosenId) continue;
-                      if (r.chosenId === 'combined') {
-                        // Use the user-confirmed split quantities
-                        const splitMap = currentSplits[r.product_id] || {};
-                        const stockRows = warehouseStock.filter((ws: any) => ws.product_id === r.product_id && ws.qty > 0);
-                        for (const ws of stockRows) {
-                          const qtyFromHere = splitMap[ws.warehouse_id] || 0;
-                          if (qtyFromHere <= 0) continue;
-                          if (!byWarehouse[ws.warehouse_id]) byWarehouse[ws.warehouse_id] = { name: ws.warehouse_name, items: [] };
-                          byWarehouse[ws.warehouse_id].items.push({ itemName: r.name, qty: qtyFromHere });
-                        }
-                        continue;
-                      }
-                      const whRow = warehouseStock.find((ws: any) => ws.warehouse_id === r.chosenId && ws.product_id === r.product_id);
-                      const whName = whRow?.warehouse_name || warehouses.find((w: any) => w.id === r.chosenId)?.name || r.chosenId;
-                      if (!byWarehouse[r.chosenId]) byWarehouse[r.chosenId] = { name: whName, items: [] };
-                      byWarehouse[r.chosenId].items.push({ itemName: r.name, qty: r.qty });
-                    }
-                    const allResolved = resolved.every((r: any) => !!r.chosenId);
-                    return { itemChecks, pendingChoices, resolved, byWarehouse, allResolved, currentSelections, currentSplits };
-                  })();
+              {/* ── Kanban Board ── */}
+              <div className="flex gap-3 overflow-x-auto pb-4 -mx-1 px-1">
+                {KANBAN_COLUMNS.map(col => {
+                  const colOrders = filteredAndSortedOrders.filter(o => o.status === col.key);
+                  const cc = colColors[col.color];
 
                   return (
-                    <div key={order.id} className={`relative glass-panel rounded-xl p-5 border border-slate-200 dark:border-white/5 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 animate-fade-in${isThisOrderLoading ? ' opacity-60 pointer-events-none' : ''}`}>
-                      {/* Invoice button — top right corner */}
-                      <button
-                        onClick={() => handleGenerateInvoice(order)}
-                        title="Print / Save Invoice PDF"
-                        className="absolute top-3 right-3 flex items-center gap-1 px-2 py-1 rounded-lg bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 text-[10px] font-bold transition z-10"
-                      >
-                        <Printer className="w-3 h-3" />
-                        Invoice
-                      </button>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-mono font-bold text-blue-600 dark:text-blue-400">{order.id}</span>
-                          <span className="text-slate-400 dark:text-gray-600">&bull;</span>
-                          <span className="text-xs text-slate-500 dark:text-gray-400">{new Date(order.created_at).toLocaleString()}</span>
-                          <span className="text-slate-400 dark:text-gray-600">&bull;</span>
-                          <span className="text-xs text-blue-600 dark:text-blue-400 uppercase font-bold tracking-wider text-[10px]">{order.type}</span>
-                          {order.warehouse_name && (
-                            <>
-                              <span className="text-slate-400 dark:text-gray-600">&bull;</span>
-                              <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-indigo-100 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/20">📦 {order.warehouse_name}</span>
-                            </>
-                          )}
+                    <div key={col.key} className="flex flex-col gap-3 flex-shrink-0 w-[260px]">
+
+                      {/* Column header */}
+                      <div className={`flex items-center justify-between px-3 py-2 rounded-xl border ${cc.header}`}>
+                        <div className="flex items-center gap-2">
+                          <div className={`w-2 h-2 rounded-full ${cc.dot}`} />
+                          <span className="text-[11px] font-bold uppercase tracking-wider">{col.label}</span>
                         </div>
-                        <h3 className="text-sm font-bold text-slate-900 dark:text-white mt-1">{order.customer_name}</h3>
-                        <div className="mt-2.5 flex flex-wrap gap-1.5">
-                          {order.items.map((item: any, idx: number) => (
-                            <span key={idx} className="text-[10px] px-2 py-0.5 rounded bg-slate-200 dark:bg-white/5 text-slate-700 dark:text-gray-300">
-                              {item.name} x {item.qty}
+                        <div className="flex items-center gap-1.5">
+                          {col.key === 'delivered' && colOrders.length > 0 && (
+                            <span className="text-[9px] font-semibold text-emerald-600 dark:text-emerald-400 hidden sm:inline">
+                              {formatSAR(colOrders.reduce((s, o) => s + o.total, 0))}
                             </span>
-                          ))}
+                          )}
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${cc.badge}`}>
+                            {colOrders.length}
+                          </span>
                         </div>
+                      </div>
 
-                        {/* Warehouse fulfillment panel — staff / manager / owner / admin / delivery — only for active orders */}
-                        {fulfillmentInfo && !['delivered','failed'].includes(currentStatus) && ['admin','superowner','owner','manager','staff','delivery'].includes(currentUser.role) && (() => {
-                          const { itemChecks, pendingChoices, byWarehouse, allResolved, currentSelections, currentSplits } = fulfillmentInfo;
-                          const hasPending = pendingChoices.length > 0;
+                      {/* Cards */}
+                      {colOrders.length === 0 ? (
+                        <div className="text-[11px] text-slate-400 dark:text-gray-600 text-center py-6 border border-dashed border-slate-200 dark:border-white/8 rounded-xl">
+                          No orders
+                        </div>
+                      ) : colOrders.map(order => {
+                        const currentStatus = order.status;
+                        const isThisOrderLoading = orderLoadingId === order.id;
+                        const ageDays = orderAgeDays(order);
+                        const isOverdue = ageDays >= 2 && !['delivered', 'failed'].includes(currentStatus);
 
+                        // Automatic fulfillment preview — primary warehouse first, combined
+                        // overflow from other warehouses if needed. Nothing here requires a
+                        // manual choice; this is purely informational ("where will/did stock
+                        // come from").
+                        const fulfillmentInfo = (() => {
+                          if (warehouses.length === 0) return null;
+                          const isApproved = ['approved', 'packing', 'assigned', 'out_for_delivery'].includes(order.status);
+                          // For active reservations (approved/packing/assigned) use 'active';
+                          // for dispatched orders (out_for_delivery) reservations are marked 'completed' — use those too
+                          const reservationStatuses = order.status === 'out_for_delivery' ? ['active', 'completed'] : ['active'];
+
+                          const itemChecks = order.items.map((item: any) => {
+                            const thisOrderReservations = stockReservations.filter((r: any) =>
+                              r.order_id === order.id && r.product_id === item.product_id && reservationStatuses.includes(r.status)
+                            );
+                            if (thisOrderReservations.length > 0) {
+                              // Already approved — show exactly where stock was actually taken from.
+                              const sourceWh = thisOrderReservations.map((r: any) => ({
+                                warehouse_id: r.warehouse_id,
+                                warehouse_name: warehouses.find((w: any) => w.id === r.warehouse_id)?.name || r.warehouse_id,
+                                qty: r.qty
+                              }));
+                              const totalQty = sourceWh.reduce((s: number, w: any) => s + w.qty, 0);
+                              return { product_id: item.product_id, name: item.name, qty: item.qty, sourceWh, totalQty, sufficient: totalQty >= item.qty };
+                            }
+                            // Not approved yet — preview what would happen if approved right now:
+                            // primary warehouse first, then combine in overflow from other warehouses.
+                            const primary = warehouses[0];
+                            const others = warehouses.slice(1)
+                              .map((w: any) => ({ warehouse_id: w.id, warehouse_name: w.name, qty: warehouseStock.find((ws: any) => ws.warehouse_id === w.id && ws.product_id === item.product_id)?.qty || 0 }))
+                              .sort((a: any, b: any) => b.qty - a.qty);
+                            const primaryQty = warehouseStock.find((ws: any) => ws.warehouse_id === primary.id && ws.product_id === item.product_id)?.qty || 0;
+                            const portions: { warehouse_id: string; warehouse_name: string; qty: number }[] = [];
+                            let stillNeeded = item.qty;
+                            if (primaryQty > 0) {
+                              const take = Math.min(stillNeeded, primaryQty);
+                              portions.push({ warehouse_id: primary.id, warehouse_name: primary.name, qty: take });
+                              stillNeeded -= take;
+                            }
+                            for (const o of others) {
+                              if (stillNeeded <= 0) break;
+                              const take = Math.min(stillNeeded, o.qty);
+                              if (take > 0) {
+                                portions.push(o.warehouse_id ? { warehouse_id: o.warehouse_id, warehouse_name: o.warehouse_name, qty: take } : o);
+                                stillNeeded -= take;
+                              }
+                            }
+                            const totalQty = portions.reduce((s, p) => s + p.qty, 0);
+                            return { product_id: item.product_id, name: item.name, qty: item.qty, sourceWh: portions, totalQty, sufficient: stillNeeded <= 0 };
+                          });
+
+                          const byWarehouse: Record<string, { name: string; items: { itemName: string; qty: number }[] }> = {};
+                          for (const ic of itemChecks) {
+                            for (const wh of ic.sourceWh) {
+                              if (!byWarehouse[wh.warehouse_id]) byWarehouse[wh.warehouse_id] = { name: wh.warehouse_name, items: [] };
+                              byWarehouse[wh.warehouse_id].items.push({ itemName: ic.name, qty: wh.qty });
+                            }
+                          }
+                          return { itemChecks, byWarehouse };
+                        })();
+
+                        // ── Delivered: compact reference row ──────────────────
+                        if (currentStatus === 'delivered') {
                           return (
-                            <div className="mt-3 rounded-lg border border-slate-200 dark:border-white/8 overflow-hidden text-[11px]">
-                              {/* Header */}
-                              <div className={`px-3 py-1.5 font-bold text-[10px] uppercase tracking-wider border-b ${hasPending ? 'bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-400 border-blue-200 dark:border-blue-500/20' : 'bg-slate-50 dark:bg-white/3 text-slate-500 dark:text-gray-400 border-slate-200 dark:border-white/8'}`}>
-                                {hasPending ? '🏢 Select warehouse per item' : '📦 Pickup plan'}
+                            <div
+                              key={order.id}
+                              className="flex items-center justify-between gap-2 rounded-lg border border-slate-100 dark:border-white/5 px-3 py-2 bg-white dark:bg-white/2 opacity-60 hover:opacity-100 transition-opacity"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <span className="text-[10px] font-mono font-bold text-emerald-600 dark:text-emerald-400">{order.id}</span>
+                                  <span className="text-[10px] text-slate-500 dark:text-gray-400 truncate">{order.customer_name}</span>
+                                </div>
+                                <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                                  <span className="text-[10px] font-bold text-slate-700 dark:text-gray-200">{formatSAR(order.total)}</span>
+                                  {order.cod_tracking && (
+                                    <span className="text-[9px] font-bold px-1 py-0.5 rounded bg-amber-100 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20">COD {order.cod_collected ? '✓' : ''}</span>
+                                  )}
+                                  {order.assigned_staff_name && (
+                                    <span className="text-[9px] text-slate-400 dark:text-gray-500">via {order.assigned_staff_name}</span>
+                                  )}
+                                </div>
                               </div>
+                              <button
+                                onClick={() => handleGenerateInvoice(order)}
+                                title="Print / Save Invoice PDF"
+                                className="shrink-0 flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 text-[9px] font-bold transition"
+                              >
+                                <Printer className="w-2.5 h-2.5" />
+                                Invoice
+                              </button>
+                            </div>
+                          );
+                        }
 
-                              <div className="bg-white dark:bg-white/2 px-3 py-2 space-y-1.5">
+                        return (
+                          <div
+                            key={order.id}
+                            className={`relative flex flex-col gap-3 rounded-xl border p-3.5 bg-white dark:bg-white/3 animate-fade-in transition
+                              ${isOverdue ? 'border-red-300 dark:border-red-500/40' : 'border-slate-200 dark:border-white/8'}
+                              ${isThisOrderLoading ? 'opacity-50 pointer-events-none' : ''}
+                            `}
+                          >
+                            {/* Invoice button — owner/manager/staff after approval; customer only after delivery (see Order History) */}
+                            {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && ['approved', 'packing', 'assigned', 'out_for_delivery'].includes(currentStatus) && (
+                            <button
+                              onClick={() => handleGenerateInvoice(order)}
+                              title="Print / Save Invoice PDF"
+                              className="absolute top-2.5 right-2.5 flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 text-[9px] font-bold transition z-10"
+                            >
+                              <Printer className="w-2.5 h-2.5" />
+                              Invoice
+                            </button>
+                            )}
 
-                                {/* Per-item rows */}
-                                {itemChecks.map((ic: any) => {
-                                  const savedSel = currentSelections[ic.product_id];
-                                  const alreadySaved = ic.savedWh;
+                            {/* Order ID + age */}
+                            <div className="flex items-start gap-2 pr-14">
+                              <div>
+                                <span className="text-[10px] font-mono font-bold text-blue-600 dark:text-blue-400">{order.id}</span>
+                                <p className="text-xs font-bold text-slate-900 dark:text-white mt-0.5 leading-tight">{order.customer_name}</p>
+                                <div className="flex items-center gap-1.5 mt-1 flex-wrap">
+                                  <span className="text-[9px] text-slate-400 dark:text-gray-500">{new Date(order.created_at).toLocaleDateString()}</span>
+                                  <span className="text-[9px] text-blue-600 dark:text-blue-400 uppercase font-bold tracking-wide">{order.type}</span>
+                                  {order.warehouse_name && (
+                                    <span className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950/40 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/20 font-bold">📦 {order.warehouse_name}</span>
+                                  )}
+                                </div>
+                              </div>
+                            </div>
 
-                                  // For approved orders, show the reservation allocation instead of re-checking live stock
-                                  if (ic.isApproved && ic.reservedWh && ic.reservedWh.length > 0) {
-                                    return (
+                            {/* Age badge — overdue warning */}
+                            {ageDays >= 1 && !['delivered', 'failed'].includes(currentStatus) && (
+                              <div className={`text-[10px] font-bold px-2 py-0.5 rounded-full self-start border
+                                ${ageDays >= 3 ? 'bg-red-100 dark:bg-red-950/40 text-red-600 dark:text-red-400 border-red-200 dark:border-red-500/30' :
+                                  ageDays >= 2 ? 'bg-amber-100 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border-amber-200 dark:border-amber-500/30' :
+                                  'bg-slate-100 dark:bg-white/5 text-slate-500 dark:text-gray-500 border-slate-200 dark:border-white/10'}`}
+                              >
+                                {ageDays === 1 ? '1 day ago' : `${ageDays} days ago`}
+                              </div>
+                            )}
+
+                            {/* Items */}
+                            <div className="flex flex-wrap gap-1">
+                              {order.items.map((item: any, idx: number) => (
+                                <span key={idx} className="text-[9px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-gray-400 border border-slate-200 dark:border-white/8">
+                                  {item.name} ×{item.qty}
+                                </span>
+                              ))}
+                            </div>
+
+                            {/* Total + COD */}
+                            <div className="flex items-center justify-between">
+                              <span className="text-xs font-extrabold text-slate-900 dark:text-white">{formatSAR(order.total)}</span>
+                              <div className="flex items-center gap-1.5">
+                                {order.discount > 0 && (
+                                  <span className="text-[9px] text-emerald-600 dark:text-emerald-400">-{formatSAR(order.discount)}</span>
+                                )}
+                                {order.cod_tracking && (
+                                  <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20 uppercase tracking-wide">
+                                    COD {order.cod_collected ? '✓' : ''}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            {/* Driver info — assigned / out_for_delivery */}
+                            {['assigned', 'out_for_delivery', 'delivered'].includes(currentStatus) && order.assigned_staff_name && (
+                              <div className="flex items-center gap-2 px-2 py-1.5 rounded-lg bg-slate-50 dark:bg-white/5 border border-slate-200 dark:border-white/8">
+                                <Truck className="w-3 h-3 text-slate-400 dark:text-gray-500 shrink-0" />
+                                <div>
+                                  <p className="text-[9px] text-slate-400 dark:text-gray-500 uppercase font-semibold">Driver</p>
+                                  <p className="text-[10px] font-bold text-slate-800 dark:text-gray-200">{order.assigned_staff_name}</p>
+                                  {order.delivery_route && <p className="text-[9px] text-slate-500 dark:text-gray-500">{order.delivery_route}</p>}
+                                </div>
+                              </div>
+                            )}
+
+                            {/* ── Warehouse fulfillment panel ── */}
+                            {fulfillmentInfo && !['delivered','failed'].includes(currentStatus) && ['admin','superowner','owner','manager','warehouse_manager','staff','delivery'].includes(currentUser.role) && (() => {
+                              const { itemChecks, byWarehouse } = fulfillmentInfo;
+                              const anyShort = itemChecks.some((ic: any) => !ic.sufficient);
+                              const isApprovedAlready = ['approved', 'packing', 'assigned', 'out_for_delivery'].includes(order.status);
+                              return (
+                                <div className="rounded-lg border border-slate-200 dark:border-white/8 overflow-hidden text-[11px]">
+                                  <div className="px-3 py-1.5 font-bold text-[10px] uppercase tracking-wider border-b bg-slate-50 dark:bg-white/3 text-slate-500 dark:text-gray-400 border-slate-200 dark:border-white/8">
+                                    {isApprovedAlready ? '📦 Pickup plan' : '📦 Will fulfill from'}
+                                  </div>
+                                  <div className="bg-white dark:bg-white/2 px-3 py-2 space-y-1.5">
+                                    {itemChecks.map((ic: any) => (
                                       <div key={ic.product_id} className="flex flex-wrap items-center gap-2 py-1 border-b border-slate-100 dark:border-white/5 last:border-0">
-                                        <span className="text-slate-700 dark:text-gray-200 font-semibold min-w-[120px]">
-                                          {ic.name} <span className="text-slate-400 dark:text-gray-500 font-normal">×{ic.qty}</span>
-                                        </span>
-                                        {ic.reservedWh.length === 1 ? (
-                                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/20 font-bold">
-                                            📦 {ic.reservedWh[0].warehouse_name}
-                                          </span>
-                                        ) : (
-                                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-500/20 font-bold">
-                                            🔀 {ic.reservedWh.map((r: any) => `${r.warehouse_name} ×${r.qty}`).join(' + ')}
+                                        <span className="text-slate-700 dark:text-gray-200 font-semibold min-w-[100px]">{ic.name} <span className="text-slate-400 dark:text-gray-500 font-normal">×{ic.qty}</span></span>
+                                        {ic.sourceWh.length === 0 && (
+                                          <span className="text-[10px] px-2 py-0.5 rounded bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20 font-bold">❌ Out of stock</span>
+                                        )}
+                                        {ic.sourceWh.length === 1 && (
+                                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/20 font-bold">📦 {ic.sourceWh[0].warehouse_name}</span>
+                                        )}
+                                        {ic.sourceWh.length > 1 && (
+                                          <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-500/20 font-bold">🔀 {ic.sourceWh.map((w: any) => `${w.warehouse_name} ×${w.qty}`).join(' + ')}</span>
+                                        )}
+                                        {!ic.sufficient && ic.sourceWh.length > 0 && (
+                                          <span className="text-[10px] px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20">
+                                            ⚠ Only {ic.totalQty} of {ic.qty} available across all warehouses
                                           </span>
                                         )}
                                       </div>
-                                    );
-                                  }
+                                    ))}
+                                    {Object.keys(byWarehouse).length > 0 && (
+                                      <div className="mt-2 pt-2 border-t border-slate-100 dark:border-white/5 space-y-1">
+                                        <p className="text-[9px] font-bold uppercase tracking-wider text-slate-400 dark:text-gray-500">{isApprovedAlready ? 'Driver pickup plan' : 'Pickup plan preview'}</p>
+                                        {Object.entries(byWarehouse).map(([whId, whData]: [string, any]) => (
+                                          <div key={whId} className="flex items-start gap-2">
+                                            <span className="shrink-0 mt-0.5 px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-500/20 font-bold text-[10px] whitespace-nowrap">📦 {whData.name}</span>
+                                            <span className="text-slate-600 dark:text-gray-300 text-[10px]">{whData.items.map((it: any) => `${it.itemName} ×${it.qty}`).join(' · ')}</span>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              );
+                            })()}
 
-                                  const chosenId = savedSel || (alreadySaved ? alreadySaved.id : null) || (ic.sufficient.length === 1 ? ic.sufficient[0].warehouse_id : null);
-                                  const chosenName = chosenId && chosenId !== 'combined'
-                                    ? (warehouseStock.find((ws: any) => ws.warehouse_id === chosenId && ws.product_id === ic.product_id)?.warehouse_name
-                                       || warehouses.find((w: any) => w.id === chosenId)?.name
-                                       || chosenId)
-                                    : null;
-                                  const needsChoice = ic.sufficient.length > 1 && !chosenId;
-                                  const noStock = ic.sufficient.length === 0 && !ic.combinedSufficient;
-                                  // Combined split: stock is spread across warehouses, need user to specify per-warehouse qty
-                                  const needsSplitInput = ic.combinedSufficient && !ic.splitConfirmed && !alreadySaved;
-                                  const splitMap = currentSplits[ic.product_id] || {};
-                                  const isCombined = ic.combinedSufficient && ic.sufficient.length === 0;
-
-                                  return (
-                                    <div key={ic.product_id} className={`flex flex-wrap items-center gap-2 py-1 border-b border-slate-100 dark:border-white/5 last:border-0`}>
-                                      {/* Item name + qty */}
-                                      <span className="text-slate-700 dark:text-gray-200 font-semibold min-w-[120px]">
-                                        {ic.name} <span className="text-slate-400 dark:text-gray-500 font-normal">×{ic.qty}</span>
-                                      </span>
-
-                                      {/* No stock anywhere */}
-                                      {noStock && (
-                                        <span className="text-[10px] px-2 py-0.5 rounded bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20 font-bold">
-                                          ❌ Out of stock
-                                        </span>
-                                      )}
-
-                                      {/* Combined stock: user must enter how many to take from each warehouse */}
-                                      {needsSplitInput && (
-                                        <div className="w-full space-y-1.5 p-2 rounded bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-500/20">
-                                          <p className="text-[10px] font-bold text-blue-700 dark:text-blue-400">
-                                            🔀 Stock is split — specify how many units to take from each warehouse (total needed: {ic.qty})
-                                          </p>
-                                          {ic.partial.map((ws: any) => (
-                                            <div key={ws.warehouse_id} className="flex items-center gap-2">
-                                              <span className="text-[10px] text-slate-700 dark:text-gray-300 min-w-[110px]">{ws.warehouse_name} <span className="text-slate-400">({ws.qty} avail)</span></span>
-                                              <input
-                                                type="number"
-                                                min={0}
-                                                max={Math.min(ws.qty, ic.qty)}
-                                                value={splitMap[ws.warehouse_id] ?? ''}
-                                                placeholder="0"
-                                                onChange={(e) => {
-                                                  const val = Math.min(ws.qty, Math.max(0, parseInt(e.target.value) || 0));
-                                                  setCombinedSplitQty(prev => ({
-                                                    ...prev,
-                                                    [order.id]: {
-                                                      ...(prev[order.id] || {}),
-                                                      [ic.product_id]: { ...(prev[order.id]?.[ic.product_id] || {}), [ws.warehouse_id]: val }
-                                                    }
-                                                  }));
-                                                }}
-                                                className="w-16 px-1.5 py-0.5 rounded border border-blue-300 dark:border-blue-500/50 bg-white dark:bg-blue-950/20 text-xs text-center text-slate-800 dark:text-white"
-                                              />
-                                            </div>
-                                          ))}
-                                          {ic.splitTotal > 0 && (
-                                            <p className={`text-[10px] font-bold ${ic.splitTotal === ic.qty ? 'text-emerald-600 dark:text-emerald-400' : ic.splitTotal > ic.qty ? 'text-red-500' : 'text-amber-500'}`}>
-                                              {ic.splitTotal === ic.qty ? `✓ Total confirmed: ${ic.splitTotal}` : `Total entered: ${ic.splitTotal} / ${ic.qty} needed`}
-                                            </p>
-                                          )}
-                                        </div>
-                                      )}
-
-                                      {/* Combined split confirmed */}
-                                      {ic.combinedSufficient && ic.splitConfirmed && !alreadySaved && (
-                                        <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-500/20 font-bold">
-                                          🔀 Split confirmed
-                                          <button
-                                            className="ml-1 text-emerald-400 hover:text-emerald-600 cursor-pointer"
-                                            onClick={() => setCombinedSplitQty(prev => {
-                                              const n = { ...prev, [order.id]: { ...(prev[order.id] || {}) } };
-                                              delete n[order.id][ic.product_id];
-                                              return n;
-                                            })}
-                                            title="Edit split"
-                                          >✏️</button>
-                                        </span>
-                                      )}
-
-                                      {/* Only partial stock (no warehouse has enough, not enough combined either) */}
-                                      {!noStock && !isCombined && ic.sufficient.length === 0 && ic.partial.length > 0 && (
-                                        <span className="text-[10px] px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20">
-                                          ⚠ Partial only: {ic.partial.map((ws: any) => `${ws.warehouse_name} (${ws.qty})`).join(', ')} — need {ic.qty}, have {ic.totalQty}
-                                        </span>
-                                      )}
-
-                                      {/* Already chosen / single option */}
-                                      {chosenId && !needsChoice && (
-                                        <span className="inline-flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-500/20 font-bold">
-                                          📦 {chosenName}
-                                          {ic.sufficient.length > 1 && (
-                                            <button
-                                              className="ml-1 text-indigo-400 hover:text-indigo-600 dark:hover:text-indigo-200 cursor-pointer"
-                                              onClick={() => setItemWarehouseSelections(prev => {
-                                                const next = { ...prev, [order.id]: { ...(prev[order.id] || {}) } };
-                                                delete next[order.id][ic.product_id];
-                                                return next;
-                                              })}
-                                              title="Change warehouse"
-                                            >✏️</button>
-                                          )}
-                                        </span>
-                                      )}
-
-                                      {/* Multiple choices available — show picker buttons */}
-                                      {needsChoice && (
-                                        <div className="flex flex-wrap gap-1">
-                                          {ic.sufficient.map((ws: any) => (
-                                            <button
-                                              key={ws.warehouse_id}
-                                              onClick={() => setItemWarehouseSelections(prev => ({
-                                                ...prev,
-                                                [order.id]: { ...(prev[order.id] || {}), [ic.product_id]: ws.warehouse_id }
-                                              }))}
-                                              className="px-2 py-0.5 rounded border-2 border-indigo-300 dark:border-indigo-500/50 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-700 dark:text-indigo-300 font-bold text-[10px] hover:bg-indigo-100 dark:hover:bg-indigo-900/50 cursor-pointer transition"
-                                            >
-                                              📦 {ws.warehouse_name} <span className="text-indigo-400 dark:text-indigo-500 font-normal">({ws.qty} in stock)</span>
-                                            </button>
-                                          ))}
-                                        </div>
-                                      )}
+                            {/* ── Pick List panel ── */}
+                            {currentStatus === 'packing' && (() => {
+                              const matchingPl = pickLists.find(pl => pl.order_id === order.id);
+                              if (!matchingPl) {
+                                return (
+                                  <div className="rounded-lg border border-amber-200 dark:border-amber-500/20 overflow-hidden text-[11px]">
+                                    <div className="px-3 py-2 bg-amber-50/50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 flex flex-wrap gap-2 justify-between items-center">
+                                      <span>⚠️ No Pick List yet.</span>
+                                      <button
+                                        onClick={async () => {
+                                          const pickItems = order.items.map((item: any) => ({ product_id: item.product_id, name: item.name, qty: item.qty, warehouse_id: item.warehouse_id || order.warehouse_id || 'wh-main', warehouse_name: item.warehouse_name || order.warehouse_name || 'Main Warehouse', picked_qty: 0 }));
+                                          try { await db.createPickList(order.id, pickItems); await reloadData(); }
+                                          catch (err: any) { alert("Could not generate pick list: " + err.message); }
+                                        }}
+                                        className="px-2 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-[9px] font-bold transition cursor-pointer"
+                                      >Generate</button>
                                     </div>
-                                  );
-                                })}
+                                  </div>
+                                );
+                              }
+                              return (
+                                <div className="rounded-lg border border-purple-200 dark:border-purple-500/20 overflow-hidden text-[11px]">
+                                  <div className="px-3 py-1.5 font-bold text-[10px] uppercase tracking-wider bg-purple-50 dark:bg-purple-950/30 text-purple-700 dark:text-purple-400 border-b border-purple-200 dark:border-purple-500/20 flex justify-between items-center">
+                                    <span>📋 Pick List</span>
+                                    <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${matchingPl.status === 'completed' ? 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400' : 'bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400'}`}>{matchingPl.status}</span>
+                                  </div>
+                                  <div className="bg-white dark:bg-white/2 px-3 py-2 space-y-1.5">
+                                    {matchingPl.items.map(item => {
+                                      const isItemPicked = item.picked_qty === item.qty;
+                                      const rowKey = `${item.product_id}__${item.warehouse_id}`;
+                                      return (
+                                        <div key={rowKey} className="flex items-center justify-between py-1 border-b border-slate-100 dark:border-white/5 last:border-0">
+                                          <div className="flex flex-col">
+                                            <span className="text-slate-800 dark:text-gray-200 font-semibold">{item.name} × {item.qty}</span>
+                                            <span className="text-slate-400 dark:text-gray-500 text-[10px]">📦 {item.warehouse_name}</span>
+                                          </div>
+                                          <label className="flex items-center gap-1.5 cursor-pointer">
+                                            <input
+                                              type="checkbox"
+                                              checked={isItemPicked}
+                                              onChange={(e) => handlePickItemToggle(matchingPl.id, item.product_id, e.target.checked, item.warehouse_id)}
+                                              className="w-4 h-4 rounded text-purple-600 focus:ring-purple-500 border-slate-300 dark:border-white/10 dark:bg-white/5 cursor-pointer"
+                                            />
+                                            <span className={`text-[10px] font-bold ${isItemPicked ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400 dark:text-gray-500'}`}>{isItemPicked ? 'Picked' : 'To Pick'}</span>
+                                          </label>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              );
+                            })()}
 
-                                {/* Save button — shown when all items are resolved and there are new UI selections or confirmed splits */}
-                                {allResolved && !hasPending && (Object.keys(currentSelections).length > 0 || Object.keys(currentSplits).length > 0) && (
+                            {/* ── Dispatch detail panel — collapsible ── */}
+                            {currentStatus === 'out_for_delivery' && (() => {
+                              const matchingDp = dispatches.find(d => d.order_id === order.id);
+                              if (!matchingDp) return null;
+                              return (
+                                <details className="rounded-lg border border-teal-200 dark:border-teal-500/20 overflow-hidden text-[11px] group">
+                                  <summary className="px-3 py-1.5 font-bold text-[10px] uppercase tracking-wider bg-teal-50 dark:bg-teal-950/30 text-teal-700 dark:text-teal-400 cursor-pointer select-none list-none flex items-center justify-between">
+                                    <span>🚚 Dispatch details</span>
+                                    <span className="text-teal-400 dark:text-teal-600 group-open:rotate-180 transition-transform inline-block">▾</span>
+                                  </summary>
+                                  <div className="bg-white dark:bg-white/2 px-3 py-2 space-y-0.5 text-slate-700 dark:text-gray-300">
+                                    <p><span className="text-slate-400 dark:text-gray-500">Dispatched:</span> {new Date(matchingDp.dispatched_at).toLocaleString()}</p>
+                                    <p><span className="text-slate-400 dark:text-gray-500">By:</span> {matchingDp.dispatched_by_name}</p>
+                                    {matchingDp.carrier_details && <p><span className="text-slate-400 dark:text-gray-500">Carrier:</span> {matchingDp.carrier_details}</p>}
+                                  </div>
+                                </details>
+                              );
+                            })()}
+
+                            {/* ── Action button — one per stage ── */}
+                            <div className="flex flex-col gap-1.5 pt-1 border-t border-slate-100 dark:border-white/5">
+
+                              {/* Failed reason */}
+                              {currentStatus === 'failed' && (() => {
+                                const cancelEntry = order.status_history.find((h: any) => h.status === 'failed' && h.notes);
+                                return (
+                                  <span className="text-[10px] text-red-500 dark:text-red-400 italic">
+                                    {cancelEntry ? `Cancelled: ${cancelEntry.notes}` : 'Failed'}
+                                  </span>
+                                );
+                              })()}
+
+                              {/* created → Approve */}
+                              {currentStatus === 'created' && ['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
+                                <button
+                                  disabled={isThisOrderLoading}
+                                  onClick={() => withOrderLock(order.id, async () => {
+                                    try {
+                                      await db.updateOrderStatus(order.id, 'approved', currentUser);
+                                      await reloadOrdersAndStock();
+                                    } catch (err: any) {
+                                      if (err instanceof OutOfStockError) {
+                                        const partialItems = err.outOfStockItems.filter((i: any) => i.availableQty > 0);
+                                        const fullyOutItems = err.outOfStockItems.filter((i: any) => !i.availableQty || i.availableQty === 0);
+                                        const initQtys: Record<string, number> = {};
+                                        partialItems.forEach((i: any) => { initQtys[i.product_id] = i.availableQty; });
+                                        setAdjustedQtys(initQtys);
+                                        setOutOfStockDialogData({ orderId: order.id, availableItems: err.availableItems, outOfStockItems: fullyOutItems, partialItems });
+                                        setShowOutOfStockDialog(true);
+                                      } else {
+                                        alert(err.message || "Failed to approve order.");
+                                      }
+                                    }
+                                  })}
+                                  className="w-full px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
+                                >
+                                  {isThisOrderLoading ? '…' : 'Approve Order'}
+                                </button>
+                              )}
+
+                              {/* approved → Start Packing */}
+                              {currentStatus === 'approved' && ['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
+                                <button
+                                  disabled={isThisOrderLoading}
+                                  onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'packing', currentUser); await reloadOrdersAndStock(); })}
+                                  className="w-full px-3 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
+                                >
+                                  {isThisOrderLoading ? '…' : 'Start Packing'}
+                                </button>
+                              )}
+
+                              {/* packing → Assign Driver */}
+                              {currentStatus === 'packing' && ['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (() => {
+                                const matchingPl = pickLists.find(pl => pl.order_id === order.id);
+                                const isPickListCompleted = matchingPl ? matchingPl.status === 'completed' : true;
+                                return (
+                                  <button
+                                    disabled={isThisOrderLoading || !isPickListCompleted}
+                                    title={!isPickListCompleted ? 'Complete all pick list items before assigning driver' : ''}
+                                    onClick={() => {
+                                      setAssignForm({ orderId: order.id, staffId: usersList.filter(u => u.role === 'delivery')[0]?.id || "", route: "" });
+                                      setShowAssignModal(true);
+                                    }}
+                                    className="w-full px-3 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
+                                  >
+                                    {isThisOrderLoading ? '…' : !isPickListCompleted ? '⚠ Complete Picking First' : 'Assign Driver'}
+                                  </button>
+                                );
+                              })()}
+
+                              {/* assigned → Dispatch */}
+                              {currentStatus === 'assigned' && ['admin', 'owner', 'manager', 'staff', 'delivery'].includes(currentUser.role) && (
+                                <button
+                                  disabled={isThisOrderLoading}
+                                  onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'out_for_delivery', currentUser); await reloadOrdersAndStock(); })}
+                                  className="w-full px-3 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
+                                >
+                                  {isThisOrderLoading ? '…' : 'Dispatch Order'}
+                                </button>
+                              )}
+
+                              {/* out_for_delivery → Delivered / Fail */}
+                              {currentStatus === 'out_for_delivery' && ['admin', 'owner', 'manager', 'staff', 'delivery'].includes(currentUser.role) && (
+                                <div className="flex gap-1.5">
                                   <button
                                     disabled={isThisOrderLoading}
-                                    onClick={() => withOrderLock(order.id, async () => {
-                                      const selections: Record<string, { warehouseId: string; warehouseName: string; splitWarehouses?: { warehouse_id: string; warehouse_name: string; qty: number }[] }> = {};
-                                      // Standard single-warehouse selections
-                                      for (const [pid, whId] of Object.entries(currentSelections)) {
-                                        const whRow = warehouseStock.find((ws: any) => ws.warehouse_id === whId && ws.product_id === pid);
-                                        const whName = whRow?.warehouse_name || warehouses.find((w: any) => w.id === whId)?.name || whId as string;
-                                        selections[pid] = { warehouseId: whId as string, warehouseName: whName };
-                                      }
-                                      // Combined split — save ALL warehouse portions so dispatch deducts from each correctly
-                                      for (const [pid, splitMap] of Object.entries(currentSplits)) {
-                                        const portions = Object.entries(splitMap as Record<string, number>)
-                                          .filter(([, q]) => (q || 0) > 0)
-                                          .map(([whId, qty]) => {
-                                            const whRow = warehouseStock.find((ws: any) => ws.warehouse_id === whId && ws.product_id === pid);
-                                            const whName = whRow?.warehouse_name || warehouses.find((w: any) => w.id === whId)?.name || whId;
-                                            return { warehouse_id: whId, warehouse_name: whName, qty: qty as number };
-                                          })
-                                          .sort((a, b) => b.qty - a.qty);
-                                        const primaryWh = portions[0];
-                                        if (primaryWh) {
-                                          selections[pid] = {
-                                            warehouseId: primaryWh.warehouse_id,
-                                            warehouseName: portions.length > 1
-                                              ? `Split: ${portions.map(p => `${p.warehouse_name} ×${p.qty}`).join(' + ')}`
-                                              : primaryWh.warehouse_name,
-                                            splitWarehouses: portions.length > 1 ? portions : undefined
-                                          };
-                                        }
-                                      }
-                                      await db.saveOrderItemWarehouses(order.id, selections, currentUser);
-                                      setItemWarehouseSelections(prev => { const n = {...prev}; delete n[order.id]; return n; });
-                                      setCombinedSplitQty(prev => { const n = {...prev}; delete n[order.id]; return n; });
-                                      await reloadOrdersAndStock();
-                                    })}
-                                    className="mt-1 w-full py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[11px] disabled:opacity-50 disabled:cursor-not-allowed transition cursor-pointer"
+                                    onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'delivered', currentUser, { codCollected: order.cod_tracking ? true : false }); await reloadOrdersAndStock(); })}
+                                    className="flex-1 px-2 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
                                   >
-                                    ✓ Save warehouse assignments
+                                    {isThisOrderLoading ? '…' : '✓ Delivered'}
                                   </button>
-                                )}
-
-                                {/* Driver pickup summary — grouped by warehouse */}
-                                {allResolved && Object.keys(byWarehouse).length > 0 && Object.keys(currentSelections).length === 0 && Object.keys(currentSplits).length === 0 && (
-                                  <div className="mt-2 pt-2 border-t border-slate-100 dark:border-white/5 space-y-1">
-                                    <p className="text-[9px] font-bold uppercase tracking-wider text-slate-400 dark:text-gray-500">Driver pickup plan</p>
-                                    {Object.entries(byWarehouse).map(([whId, whData]: [string, any]) => (
-                                      <div key={whId} className="flex items-start gap-2">
-                                        <span className="shrink-0 mt-0.5 px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-950/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-500/20 font-bold text-[10px] whitespace-nowrap">
-                                          📦 {whData.name}
-                                        </span>
-                                        <span className="text-slate-600 dark:text-gray-300 text-[10px]">
-                                          {whData.items.map((it: any) => `${it.itemName} ×${it.qty}`).join(' · ')}
-                                        </span>
-                                      </div>
-                                    ))}
-                                  </div>
-                                )}
-
-                              </div>
-                            </div>
-                          );
-                        })()}
-
-                        {/* Pick List Panel */}
-                        {currentStatus === 'packing' && (() => {
-                          const matchingPl = pickLists.find(pl => pl.order_id === order.id);
-                          if (!matchingPl) {
-                            return (
-                              <div className="mt-3 rounded-lg border border-amber-200 dark:border-amber-500/20 overflow-hidden text-[11px]">
-                                <div className="px-3 py-2 bg-amber-50/50 dark:bg-amber-950/20 text-amber-700 dark:text-amber-400 flex flex-wrap gap-2 justify-between items-center">
-                                  <span>⚠️ No Pick List generated for this order.</span>
                                   <button
-                                    onClick={async () => {
-                                      const pickItems = order.items.map((item: any) => ({
-                                        product_id: item.product_id,
-                                        name: item.name,
-                                        qty: item.qty,
-                                        warehouse_id: item.warehouse_id || order.warehouse_id || 'wh-main',
-                                        warehouse_name: item.warehouse_name || order.warehouse_name || 'Main Warehouse',
-                                        picked_qty: 0
-                                      }));
-                                      try {
-                                        await db.createPickList(order.id, pickItems);
-                                        await reloadData();
-                                      } catch (err: any) {
-                                        alert("Could not generate pick list: " + err.message);
-                                      }
-                                    }}
-                                    className="px-2 py-1 rounded bg-amber-600 hover:bg-amber-500 text-white text-[9px] font-bold transition cursor-pointer"
+                                    disabled={isThisOrderLoading}
+                                    onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'failed', currentUser); await reloadOrdersAndStock(); })}
+                                    className="flex-1 px-2 py-2 rounded-lg bg-red-600 hover:bg-red-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
                                   >
-                                    Generate Pick List
+                                    {isThisOrderLoading ? '…' : '✕ Failed'}
                                   </button>
                                 </div>
-                              </div>
-                            );
-                          }
-                          return (
-                            <div className="mt-3 rounded-lg border border-purple-200 dark:border-purple-500/20 overflow-hidden text-[11px]">
-                              <div className="px-3 py-1.5 font-bold text-[10px] uppercase tracking-wider bg-purple-50 dark:bg-purple-950/30 text-purple-700 dark:text-purple-400 border-b border-purple-200 dark:border-purple-500/20 flex justify-between items-center">
-                                <span>📋 Pick List ({matchingPl.id})</span>
-                                <span className={`px-1.5 py-0.2 rounded text-[9px] font-bold uppercase tracking-wider ${
-                                  matchingPl.status === 'completed' ? 'bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400' : 'bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400'
-                                }`}>
-                                  {matchingPl.status}
-                                </span>
-                              </div>
-                              <div className="bg-white dark:bg-white/2 px-3 py-2 space-y-1.5">
-                                {matchingPl.items.map(item => {
-                                  const isItemPicked = item.picked_qty === item.qty;
-                                  // Use composite key so the same product from two warehouses renders as two distinct rows
-                                  const rowKey = `${item.product_id}__${item.warehouse_id}`;
-                                  return (
-                                    <div key={rowKey} className="flex items-center justify-between py-1 border-b border-slate-100 dark:border-white/5 last:border-0">
-                                      <div className="flex flex-col">
-                                        <span className="text-slate-800 dark:text-gray-200 font-semibold">{item.name} × {item.qty}</span>
-                                        <span className="text-slate-400 dark:text-gray-500 text-[10px]">From: 📦 {item.warehouse_name}</span>
-                                      </div>
-                                      <label className="flex items-center gap-1.5 cursor-pointer">
-                                        <input
-                                          type="checkbox"
-                                          checked={isItemPicked}
-                                          onChange={(e) => handlePickItemToggle(matchingPl.id, item.product_id, e.target.checked, item.warehouse_id)}
-                                          className="w-4 h-4 rounded text-purple-600 focus:ring-purple-500 border-slate-300 dark:border-white/10 dark:bg-white/5 cursor-pointer"
-                                        />
-                                        <span className={`text-[10px] font-bold ${isItemPicked ? 'text-emerald-600 dark:text-emerald-400' : 'text-slate-400 dark:text-gray-500'}`}>
-                                          {isItemPicked ? 'Picked' : 'To Pick'}
-                                        </span>
-                                      </label>
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          );
-                        })()}
+                              )}
 
-                        {/* Dispatch Panel */}
-                        {['out_for_delivery', 'delivered'].includes(currentStatus) && (() => {
-                          const matchingDp = dispatches.find(d => d.order_id === order.id);
-                          if (!matchingDp) return null;
-                          return (
-                            <div className="mt-3 rounded-lg border border-teal-200 dark:border-teal-500/20 overflow-hidden text-[11px]">
-                              <div className="px-3 py-1.5 font-bold text-[10px] uppercase tracking-wider bg-teal-50 dark:bg-teal-950/30 text-teal-700 dark:text-teal-400 border-b border-teal-200 dark:border-teal-500/20">
-                                🚚 Dispatch Details ({matchingDp.id})
-                              </div>
-                              <div className="bg-white dark:bg-white/2 px-3 py-2 space-y-1 text-slate-700 dark:text-gray-300">
-                                <p><span className="font-semibold text-slate-400 dark:text-gray-500">Dispatched at:</span> {new Date(matchingDp.dispatched_at).toLocaleString()}</p>
-                                <p><span className="font-semibold text-slate-400 dark:text-gray-500">Dispatched by:</span> {matchingDp.dispatched_by_name}</p>
-                                {matchingDp.carrier_details && <p><span className="font-semibold text-slate-400 dark:text-gray-500">Carrier / Route:</span> {matchingDp.carrier_details}</p>}
-                                {matchingDp.delivered_at && <p><span className="font-semibold text-slate-400 dark:text-gray-500">Delivered at:</span> {new Date(matchingDp.delivered_at).toLocaleString()}</p>}
-                              </div>
-                            </div>
-                          );
-                        })()}
-                      </div>
+                              {/* Cancel — available to managers and staff until delivered/failed */}
+                              {!['delivered', 'failed'].includes(currentStatus) && ['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
+                                <button
+                                  disabled={isThisOrderLoading}
+                                  onClick={() => { setCancelOrderId(order.id); setCancelReason(""); setShowCancelModal(true); }}
+                                  className="w-full px-3 py-1.5 rounded-lg bg-red-50 dark:bg-red-950/20 hover:bg-red-100 dark:hover:bg-red-950/40 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20 text-xs font-bold transition cursor-pointer disabled:opacity-50"
+                                >
+                                  Cancel Order
+                                </button>
+                              )}
 
-                      <div className="flex flex-col sm:flex-row items-start sm:items-center gap-4 w-full md:w-auto justify-between md:justify-end border-t border-slate-100 dark:border-white/5 pt-4 md:pt-0">
-                        {order.delivery_route && (
-                          <div className="text-left md:text-right">
-                            <span className="text-[9px] text-slate-400 dark:text-gray-500 uppercase font-semibold">Route & Driver</span>
-                            <p className="text-[10px] text-slate-900 dark:text-gray-300 font-bold">{order.delivery_route}</p>
-                            <p className="text-[10px] text-blue-600 dark:text-blue-400">Driver: {order.assigned_staff_name || "Unassigned"}</p>
+                              {/* Delete (admin only) */}
+                              {currentUser.role === 'admin' && (
+                                <button
+                                  disabled={isThisOrderLoading}
+                                  onClick={() => withOrderLock(order.id, async () => { await db.deleteOrder(order.id, currentUser); await reloadOrders(); })}
+                                  className="w-full p-1.5 rounded-lg bg-red-100 dark:bg-red-950/20 hover:bg-red-200 dark:hover:bg-red-950/40 text-red-600 dark:text-red-400 disabled:opacity-50 flex items-center justify-center gap-1 text-xs font-bold"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" /> Delete
+                                </button>
+                              )}
+                            </div>
                           </div>
-                        )}
-
-                        <div className="text-left md:text-right">
-                          <span className="text-[9px] text-slate-400 dark:text-gray-500 uppercase font-semibold">Total Amount</span>
-                          {order.discount > 0 && (
-                            <>
-                              <p className="text-[10px] text-slate-400 dark:text-gray-500 line-through">{formatSAR(order.subtotal)}</p>
-                              <p className="text-[10px] text-emerald-600 dark:text-emerald-400 font-semibold">- {formatSAR(order.discount)} customer disc.</p>
-                            </>
-                          )}
-                          {(order.manual_discount_pct > 0 || order.manual_discount_amt > 0) && (
-                            <>
-                              {order.manual_discount_pct > 0 && (
-                                <p className="text-[10px] text-amber-600 dark:text-amber-400 font-semibold">- {order.manual_discount_pct}% manual</p>
-                              )}
-                              {order.manual_discount_amt > 0 && (
-                                <p className="text-[10px] text-amber-600 dark:text-amber-400 font-semibold">- {formatSAR(order.manual_discount_amt)} manual</p>
-                              )}
-                            </>
-                          )}
-                          <p className="text-sm font-extrabold text-slate-900 dark:text-white">{formatSAR(order.total)}</p>
-                          {order.cod_tracking && (
-                            <span className="inline-block text-[9px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-wider bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 px-1 py-0.2 rounded mt-0.5">
-                              COD {order.cod_collected ? '(Collected)' : '(Pending)'}
-                            </span>
-                          )}
-                        </div>
-
-                        <div className="flex gap-2 shrink-0 items-center">
-                          <span className={`inline-flex px-3 py-1.5 rounded-lg text-xs font-bold items-center ${
-                            currentStatus === 'created' ? 'bg-amber-500/10 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-500/20' :
-                            currentStatus === 'approved' ? 'bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20' :
-                            currentStatus === 'packing' ? 'bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-200 dark:border-purple-500/20' :
-                            currentStatus === 'assigned' ? 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-400 border border-indigo-200 dark:border-indigo-500/20' :
-                            currentStatus === 'out_for_delivery' ? 'bg-teal-500/10 text-teal-600 dark:text-teal-400 border border-teal-200 dark:border-teal-500/20' :
-                            currentStatus === 'delivered' ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/20' :
-                            'bg-red-500/10 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20'
-                          }`}>
-                            {currentStatus === 'failed'
-                              ? (order.status_history.find((h: any) => h.status === 'failed' && h.notes) ? 'Cancelled' : 'Failed')
-                              : currentStatus}
-                          </span>
-
-                          {currentStatus === 'failed' && (() => {
-                            const cancelEntry = order.status_history.find((h: any) => h.status === 'failed' && h.notes);
-                            return cancelEntry ? (
-                              <span className="text-[10px] text-red-500 dark:text-red-400 italic">Reason: {(cancelEntry as any).notes}</span>
-                            ) : null;
-                          })()}
-
-                          {currentStatus === 'created' && ['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (() => {
-                            const hasPendingFulfillment = fulfillmentInfo ? fulfillmentInfo.pendingChoices.length > 0 : false;
-                            return (
-                              <button
-                                disabled={isThisOrderLoading || hasPendingFulfillment}
-                                title={hasPendingFulfillment ? 'Resolve warehouse assignments above before approving' : ''}
-                                onClick={() => withOrderLock(order.id, async () => {
-                                  // Auto-save warehouse for items that have exactly one sufficient warehouse but were never explicitly saved
-                                  if (fulfillmentInfo) {
-                                    const autoSelections: Record<string, { warehouseId: string; warehouseName: string }> = {};
-                                    for (const ic of fulfillmentInfo.itemChecks) {
-                                      if (!ic.savedWh && ic.sufficient.length === 1) {
-                                        autoSelections[ic.product_id] = { warehouseId: ic.sufficient[0].warehouse_id, warehouseName: ic.sufficient[0].warehouse_name };
-                                      }
-                                    }
-                                    if (Object.keys(autoSelections).length > 0) {
-                                      await db.saveOrderItemWarehouses(order.id, autoSelections, currentUser);
-                                    }
-                                  }
-                                  try {
-                                    await db.updateOrderStatus(order.id, 'approved', currentUser);
-                                    await reloadOrdersAndStock();
-                                  } catch (err: any) {
-                                    if (err instanceof OutOfStockError) {
-                                      setOutOfStockDialogData({
-                                        orderId: order.id,
-                                        availableItems: err.availableItems,
-                                        outOfStockItems: err.outOfStockItems
-                                      });
-                                      setShowOutOfStockDialog(true);
-                                    } else {
-                                      alert(err.message || "Failed to approve order.");
-                                    }
-                                  }
-                                })}
-                                className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
-                              >
-                                {isThisOrderLoading ? '…' : hasPendingFulfillment ? '⚠ Assign Warehouses First' : 'Approve'}
-                              </button>
-                            );
-                          })()}
-                          {currentStatus === 'approved' && ['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
-                            <button disabled={isThisOrderLoading} onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'packing', currentUser); await reloadOrders(); })} className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer">{isThisOrderLoading ? '…' : 'Start Packing'}</button>
-                          )}
-                          {currentStatus === 'packing' && ['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (() => {
-                            const matchingPl = pickLists.find(pl => pl.order_id === order.id);
-                            const isPickListCompleted = matchingPl ? matchingPl.status === 'completed' : true;
-                            return (
-                              <button
-                                disabled={isThisOrderLoading || !isPickListCompleted}
-                                title={!isPickListCompleted ? 'Complete all pick list items before assigning driver' : ''}
-                                onClick={() => {
-                                  setAssignForm({ orderId: order.id, staffId: usersList.filter(u => u.role === 'delivery')[0]?.id || "", route: "" });
-                                  setShowAssignModal(true);
-                                }}
-                                className="px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer"
-                              >
-                                {isThisOrderLoading ? '…' : !isPickListCompleted ? '⚠️ Complete Picking First' : 'Assign Driver'}
-                              </button>
-                            );
-                          })()}
-                          {currentStatus === 'assigned' && ['admin', 'owner', 'manager', 'staff', 'delivery'].includes(currentUser.role) && (
-                            <button disabled={isThisOrderLoading} onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'out_for_delivery', currentUser); await reloadOrders(); })} className="px-3 py-1.5 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer">{isThisOrderLoading ? '…' : 'Dispatch Order'}</button>
-                          )}
-                          {currentStatus === 'out_for_delivery' && ['admin', 'owner', 'manager', 'staff', 'delivery'].includes(currentUser.role) && (
-                            <div className="flex gap-1">
-                              <button disabled={isThisOrderLoading} onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'delivered', currentUser, { codCollected: order.cod_tracking ? true : false }); await reloadOrders(); })} className="px-2.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer">{isThisOrderLoading ? '…' : 'Delivered'}</button>
-                              <button disabled={isThisOrderLoading} onClick={() => withOrderLock(order.id, async () => { await db.updateOrderStatus(order.id, 'failed', currentUser); await reloadOrdersAndStock(); })} className="px-2.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-bold text-white transition cursor-pointer">{isThisOrderLoading ? '…' : 'Fail'}</button>
-                            </div>
-                          )}
-                          {!['delivered', 'failed'].includes(currentStatus) && ['admin', 'owner', 'manager'].includes(currentUser.role) && (
-                            <button disabled={isThisOrderLoading} onClick={() => { setCancelOrderId(order.id); setCancelReason(""); setShowCancelModal(true); }} className="px-3 py-1.5 rounded-lg bg-red-100 dark:bg-red-950/30 hover:bg-red-200 dark:hover:bg-red-950/50 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20 text-xs font-bold transition disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer">Cancel</button>
-                          )}
-                          {currentUser.role === 'admin' && (
-                            <button disabled={isThisOrderLoading} onClick={() => withOrderLock(order.id, async () => { await db.deleteOrder(order.id, currentUser); await reloadOrders(); })} className="p-1.5 rounded-lg bg-red-100 dark:bg-red-950/20 hover:bg-red-200 dark:hover:bg-red-950/40 text-red-600 dark:text-red-400 disabled:opacity-50 disabled:cursor-not-allowed">
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
+                        );
+                      })}
                     </div>
                   );
                 })}
+
+                {/* Failed orders — moved to Order History tab */}
               </div>
             </div>
             );
           })()}
 
-          {/* TAB 5: CREATE ORDER */}
+                    {/* TAB: ORDER HISTORY */}
+          {activeTab === "order-history" && (() => {
+            const orderTypes = Array.from(new Set(orders.map(o => o.type)));
+            const customerMap = new Map<string, string>();
+            orders.filter(o => o.customer_name).forEach(o => { if (!customerMap.has(o.customer_id)) customerMap.set(o.customer_id, o.customer_name); });
+            const customers = Array.from(customerMap.entries()).map(([id, name]) => ({ id, name }));
+
+            const historyOrders = orders
+              .filter(o => {
+                if (!['delivered', 'failed'].includes(o.status)) return false;
+                if (currentUser.role === 'customer' && o.customer_id !== currentUser.id) return false;
+                if (historyFilterStatus && o.status !== historyFilterStatus) return false;
+                if (historyFilterType && o.type !== historyFilterType) return false;
+                if (historyFilterFrom && o.created_at.split('T')[0] < historyFilterFrom) return false;
+                if (historyFilterTo && o.created_at.split('T')[0] > historyFilterTo) return false;
+                if (historyFilterCustomer && o.customer_id !== historyFilterCustomer) return false;
+                if (historySearchQuery) {
+                  const q = historySearchQuery.toLowerCase();
+                  if (!o.id.includes(historySearchQuery) && !o.customer_name.toLowerCase().includes(q)) return false;
+                }
+                return true;
+              })
+              .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+            const totalPages = Math.max(1, Math.ceil(historyOrders.length / HISTORY_PAGE_SIZE));
+            const pagedOrders = historyOrders.slice((historyPage - 1) * HISTORY_PAGE_SIZE, historyPage * HISTORY_PAGE_SIZE);
+            const hasFilter = historyFilterStatus || historyFilterType || historyFilterFrom || historyFilterTo || historyFilterCustomer || historySearchQuery;
+
+            // Invoice permission helper
+            const canPrintInvoice = (order: Order) => {
+              if (['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role)) return true;
+              if (currentUser.role === 'customer' && order.status === 'delivered') return true;
+              return false;
+            };
+
+            return (
+              <div className="space-y-6 animate-fade-in">
+                {/* Header */}
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div>
+                    <h2 className="text-xl font-bold text-slate-950 dark:text-white">Order History</h2>
+                    <p className="text-xs text-slate-500 dark:text-gray-400">All delivered and cancelled orders.</p>
+                  </div>
+                  <button
+                    onClick={() => exportToCSV(historyOrders, "order_history_export")}
+                    className="flex items-center gap-1 px-3 py-2 rounded-lg bg-white dark:bg-white/5 hover:bg-slate-100 dark:hover:bg-white/10 border border-slate-200 dark:border-white/10 text-xs font-bold text-slate-700 dark:text-gray-300 cursor-pointer"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    Export
+                  </button>
+                </div>
+
+                {/* Filters */}
+                <div className="flex flex-wrap items-end gap-3 p-4 rounded-xl bg-white dark:bg-white/3 border border-slate-200 dark:border-white/5">
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Search</label>
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-2" />
+                      <input
+                        type="text"
+                        placeholder="Order ID / Customer..."
+                        value={historySearchQuery}
+                        onChange={e => { setHistorySearchQuery(e.target.value); setHistoryPage(1); }}
+                        className="glass-input pl-8 pr-3 py-1.5 rounded-lg text-xs w-44"
+                      />
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-1 min-w-[130px]">
+                    <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Status</label>
+                    <select value={historyFilterStatus} onChange={e => { setHistoryFilterStatus(e.target.value); setHistoryPage(1); }} className="glass-input px-2.5 py-1.5 rounded-lg text-xs">
+                      <option value="">All</option>
+                      <option value="delivered">Delivered</option>
+                      <option value="failed">Cancelled / Failed</option>
+                    </select>
+                  </div>
+                  <div className="flex flex-col gap-1 min-w-[120px]">
+                    <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Order Type</label>
+                    <select value={historyFilterType} onChange={e => { setHistoryFilterType(e.target.value); setHistoryPage(1); }} className="glass-input px-2.5 py-1.5 rounded-lg text-xs">
+                      <option value="">All Types</option>
+                      {orderTypes.map(t => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </div>
+                  {currentUser.role !== 'customer' && (
+                    <div className="flex flex-col gap-1 min-w-[140px]">
+                      <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">Customer</label>
+                      <select value={historyFilterCustomer} onChange={e => { setHistoryFilterCustomer(e.target.value); setHistoryPage(1); }} className="glass-input px-2.5 py-1.5 rounded-lg text-xs">
+                        <option value="">All Customers</option>
+                        {customers.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                      </select>
+                    </div>
+                  )}
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">From Date</label>
+                    <input type="date" value={historyFilterFrom} onChange={e => { setHistoryFilterFrom(e.target.value); setHistoryPage(1); }} className="glass-input px-2.5 py-1.5 rounded-lg text-xs" />
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="text-[10px] font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider">To Date</label>
+                    <input type="date" value={historyFilterTo} onChange={e => { setHistoryFilterTo(e.target.value); setHistoryPage(1); }} className="glass-input px-2.5 py-1.5 rounded-lg text-xs" />
+                  </div>
+                  {hasFilter && (
+                    <button
+                      onClick={() => { setHistoryFilterStatus(''); setHistoryFilterType(''); setHistoryFilterFrom(''); setHistoryFilterTo(''); setHistoryFilterCustomer(''); setHistorySearchQuery(''); setHistoryPage(1); }}
+                      className="flex items-center gap-1 px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 text-xs font-bold hover:bg-red-50 dark:hover:bg-red-950/20 transition"
+                    >
+                      <X className="w-3 h-3" /> Clear
+                    </button>
+                  )}
+                  <div className="ml-auto flex items-center gap-2 self-end pb-1">
+                    <span className="text-[10px] text-slate-400 dark:text-gray-500">{historyOrders.length} orders</span>
+                    <span className="text-[10px] font-bold text-emerald-600 dark:text-emerald-400">{formatSAR(historyOrders.filter(o => o.status === 'delivered').reduce((s, o) => s + o.total, 0))}</span>
+                  </div>
+                </div>
+
+                {/* Table */}
+                <div className="rounded-xl border border-slate-200 dark:border-white/8 bg-white dark:bg-white/3 overflow-hidden">
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="border-b border-slate-100 dark:border-white/5 bg-slate-50 dark:bg-white/2">
+                          <th className="text-left px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Order ID</th>
+                          <th className="text-left px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Customer</th>
+                          <th className="text-left px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Date</th>
+                          <th className="text-left px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Type</th>
+                          <th className="text-left px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Status</th>
+                          <th className="text-right px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Total</th>
+                          <th className="text-left px-4 py-2.5 font-bold text-slate-500 dark:text-gray-400 uppercase tracking-wider text-[10px]">Notes</th>
+                          <th className="px-4 py-2.5"></th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100 dark:divide-white/5">
+                        {pagedOrders.length === 0 && (
+                          <tr>
+                            <td colSpan={8} className="text-center py-12 text-slate-400 dark:text-gray-500 text-sm">No orders found</td>
+                          </tr>
+                        )}
+                        {pagedOrders.map(order => {
+                          const cancelEntry = order.status_history?.find((h: any) => h.status === 'failed' && h.notes);
+                          const isDelivered = order.status === 'delivered';
+                          return (
+                            <tr key={order.id} className="hover:bg-slate-50 dark:hover:bg-white/2 transition-colors">
+                              <td className="px-4 py-3">
+                                <span className={`font-mono font-bold text-[11px] ${isDelivered ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400'}`}>{order.id}</span>
+                              </td>
+                              <td className="px-4 py-3 font-semibold text-slate-800 dark:text-gray-200">{order.customer_name}</td>
+                              <td className="px-4 py-3 text-slate-500 dark:text-gray-400 whitespace-nowrap">{new Date(order.created_at).toLocaleDateString()}</td>
+                              <td className="px-4 py-3">
+                                <span className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-white/5 text-slate-600 dark:text-gray-400 text-[10px] font-bold uppercase">{order.type}</span>
+                              </td>
+                              <td className="px-4 py-3">
+                                {isDelivered ? (
+                                  <span className="px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-500/20 text-[10px] font-bold">Delivered</span>
+                                ) : (
+                                  <span className="px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-950/40 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-500/20 text-[10px] font-bold">Cancelled</span>
+                                )}
+                              </td>
+                              <td className="px-4 py-3 text-right font-bold text-slate-800 dark:text-gray-200 whitespace-nowrap">{formatSAR(order.total)}</td>
+                              <td className="px-4 py-3 text-slate-400 dark:text-gray-500 italic text-[10px] max-w-[200px] truncate">
+                                {cancelEntry ? `Reason: ${(cancelEntry as any).notes}` : '—'}
+                              </td>
+                              <td className="px-4 py-3">
+                                <div className="flex items-center gap-1.5 justify-end">
+                                  {canPrintInvoice(order) && (
+                                    <button
+                                      onClick={() => handleGenerateInvoice(order)}
+                                      title="Print Invoice"
+                                      className="flex items-center gap-1 px-2 py-1 rounded-md bg-blue-50 dark:bg-blue-950/40 hover:bg-blue-100 dark:hover:bg-blue-900/50 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-500/20 text-[10px] font-bold transition"
+                                    >
+                                      <Printer className="w-3 h-3" /> Invoice
+                                    </button>
+                                  )}
+                                  {currentUser.role === 'admin' && (
+                                    <button
+                                      onClick={() => withOrderLock(order.id, async () => { await db.deleteOrder(order.id, currentUser); await reloadOrders(); })}
+                                      className="flex items-center gap-1 px-2 py-1 rounded-md bg-red-50 dark:bg-red-950/40 hover:bg-red-100 dark:hover:bg-red-900/50 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-500/20 text-[10px] font-bold transition"
+                                    >
+                                      <Trash2 className="w-3 h-3" />
+                                    </button>
+                                  )}
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {/* Pagination */}
+                  {totalPages > 1 && (
+                    <div className="flex items-center justify-between px-4 py-3 border-t border-slate-100 dark:border-white/5">
+                      <span className="text-[11px] text-slate-500 dark:text-gray-400">
+                        Page {historyPage} of {totalPages} · {historyOrders.length} orders
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          disabled={historyPage === 1}
+                          onClick={() => setHistoryPage(p => Math.max(1, p - 1))}
+                          className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-white/10 text-xs font-bold disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-white/5 transition"
+                        >‹ Prev</button>
+                        {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                          const start = Math.max(1, Math.min(historyPage - 2, totalPages - 4));
+                          const page = start + i;
+                          return (
+                            <button
+                              key={page}
+                              onClick={() => setHistoryPage(page)}
+                              className={`w-7 h-7 rounded-lg text-xs font-bold transition ${page === historyPage ? 'bg-blue-600 text-white' : 'border border-slate-200 dark:border-white/10 hover:bg-slate-100 dark:hover:bg-white/5 text-slate-700 dark:text-gray-300'}`}
+                            >{page}</button>
+                          );
+                        })}
+                        <button
+                          disabled={historyPage === totalPages}
+                          onClick={() => setHistoryPage(p => Math.min(totalPages, p + 1))}
+                          className="px-2.5 py-1 rounded-lg border border-slate-200 dark:border-white/10 text-xs font-bold disabled:opacity-40 hover:bg-slate-100 dark:hover:bg-white/5 transition"
+                        >Next ›</button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
+                    {/* TAB 5: CREATE ORDER */}
           {activeTab === "create-order" && (
             <div className="space-y-6 animate-fade-in">
               <div className="flex items-center gap-2">
@@ -3165,47 +3281,6 @@ export default function DashboardPage() {
                   Back to Orders Pipeline
                 </button>
               </div>
-
-              {/* ── Warehouse selector ── outside cart, full-width, staff/admin only */}
-              {warehouses.length > 0 && currentUser.role !== 'customer' && (
-                <div className="flex flex-wrap items-center gap-3 p-3 rounded-xl bg-indigo-50 dark:bg-indigo-950/25 border border-indigo-200 dark:border-indigo-500/25">
-                  <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-600 dark:text-indigo-400 whitespace-nowrap">
-                    📦 Fulfillment Warehouse
-                  </span>
-                  {warehouses.length === 1 ? (
-                    <span className="text-xs font-semibold text-slate-700 dark:text-gray-300">{warehouses[0].name}</span>
-                  ) : (
-                    <div className="flex flex-wrap items-center gap-2 flex-1">
-                      {warehouses.map(wh => (
-                        <button
-                          key={wh.id}
-                          onClick={() => {
-                            if (wh.id === selectedWarehouseId) return;
-                            if (cart.length > 0) {
-                              if (confirm('Changing warehouse will clear your current cart. Continue?')) {
-                                setCart([]);
-                              } else return;
-                            }
-                            setSelectedWarehouseId(wh.id);
-                          }}
-                          className={`px-3 py-1.5 rounded-lg text-[11px] font-bold transition border ${
-                            selectedWarehouseId === wh.id
-                              ? 'bg-indigo-600 text-white border-indigo-700 shadow'
-                              : 'bg-white dark:bg-indigo-950/40 text-slate-700 dark:text-gray-300 border-indigo-200 dark:border-indigo-500/30 hover:bg-indigo-100 dark:hover:bg-indigo-900/30'
-                          }`}
-                        >
-                          {wh.name}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  {selectedWarehouseId && (
-                    <span className="text-[10px] text-indigo-500 dark:text-indigo-400 ml-auto">
-                      Showing stock for selected warehouse
-                    </span>
-                  )}
-                </div>
-              )}
 
               <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                 <div className="lg:col-span-2 space-y-4">
@@ -3222,10 +3297,9 @@ export default function DashboardPage() {
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                     {filteredProducts.map(p => {
-                      // availQty = live sum from warehouseStock (all warehouses for customers, selected WH for staff)
+                      // Combined stock across all warehouses — primary warehouse is used first
+                      // automatically at fulfillment time, with overflow combined in as needed.
                       const availQty = getAvailableQty(p.id);
-                      // liveTotal = always the full cross-warehouse sum, for customer display
-                      const liveTotal = warehouseStock.filter(ws => ws.product_id === p.id).reduce((sum, ws) => sum + ws.qty, 0);
                       const outOfStock = availQty <= 0;
                       const isLow = availQty > 0 && availQty <= p.min_stock;
                       return (
@@ -3234,21 +3308,9 @@ export default function DashboardPage() {
                             <div className="flex justify-between items-start">
                               <span className="text-[10px] text-slate-400 dark:text-gray-500 font-semibold">{p.category}</span>
                               <div className="text-right">
-                                {currentUser.role === 'customer' ? (
-                                  // Customers see total combined stock across all warehouses (live)
-                                  <span className={`text-[10px] font-bold ${liveTotal <= 0 ? 'text-red-500' : liveTotal <= p.min_stock ? 'text-amber-500' : 'text-green-500'}`}>
-                                    {liveTotal <= 0 ? 'Out of stock' : `${liveTotal} in stock`}
-                                  </span>
-                                ) : (
-                                  <>
-                                    <span className={`text-[10px] font-bold ${outOfStock ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-green-500'}`}>
-                                      {availQty} avail
-                                    </span>
-                                    {selectedWarehouseId && liveTotal !== availQty && (
-                                      <span className="block text-[9px] text-slate-400 dark:text-gray-500">({liveTotal} total)</span>
-                                    )}
-                                  </>
-                                )}
+                                <span className={`text-[10px] font-bold ${outOfStock ? 'text-red-500' : isLow ? 'text-amber-500' : 'text-green-500'}`}>
+                                  {outOfStock ? 'Out of stock' : `${availQty} in stock`}
+                                </span>
                               </div>
                             </div>
                             <h4 className="text-xs font-bold text-slate-900 dark:text-white mt-1">{p.name}</h4>
@@ -3335,7 +3397,7 @@ export default function DashboardPage() {
                     const manualPctDeduction = Number(((cartDiscounted * manualDiscountPct) / 100).toFixed(2));
                     const manualAmtCapped = Number(Math.min(manualDiscountAmt, Math.max(0, cartDiscounted - manualPctDeduction)).toFixed(2));
                     const finalTotal = Number((cartDiscounted - manualPctDeduction - manualAmtCapped).toFixed(2));
-                    const canApplyManual = ['owner', 'manager', 'staff', 'admin', 'superowner'].includes(currentUser.role);
+                    const canApplyManual = ['owner', 'manager', 'warehouse_manager', 'staff', 'admin', 'superowner'].includes(currentUser.role);
                     return (
                     <div className="space-y-3 pt-4 border-t border-slate-200 dark:border-white/5 text-xs text-slate-500 dark:text-gray-400">
                       <div className="flex justify-between">
@@ -3480,13 +3542,13 @@ export default function DashboardPage() {
                   <p className="text-xs text-slate-500 dark:text-gray-400">Evaluate net sales revenues, record expenses, review customer credit accounts, and track unpaid balances.</p>
                 </div>
                 <div className="flex gap-2 shrink-0">
-                  {['admin', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
+                  {['admin', 'owner', 'manager', 'warehouse_manager', 'staff', 'accountant'].includes(currentUser.role) && (
                     <button onClick={() => setShowExpenseModal(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-bold text-white cursor-pointer">
                       <Plus className="w-3.5 h-3.5" />
                       Record Expense
                     </button>
                   )}
-                  {['admin', 'owner', 'manager', 'staff', 'accountant'].includes(currentUser.role) && (
+                  {['admin', 'owner', 'manager', 'warehouse_manager', 'staff', 'accountant'].includes(currentUser.role) && (
                     <button onClick={() => setShowPaymentModal(true)} className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-bold text-white cursor-pointer">
                       <CreditCard className="w-3.5 h-3.5" />
                       Receive B2B Payment
@@ -3825,7 +3887,7 @@ export default function DashboardPage() {
           })()}
 
           {/* TAB 7: USER MANAGEMENT */}
-          {activeTab === "users" && ['admin', 'superowner', 'owner', 'manager', 'accountant'].includes(currentUser.role) && (
+          {activeTab === "users" && ['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'accountant'].includes(currentUser.role) && (
             <div className="space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
@@ -3833,7 +3895,7 @@ export default function DashboardPage() {
                   <p className="text-xs text-slate-500 dark:text-gray-400">Control system users, setup role access, temporary credentials, and client custom pricing matrices.</p>
                 </div>
                 
-                {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                   <button
                     onClick={() => {
                       setIsEditingUser(null);
@@ -3857,7 +3919,7 @@ export default function DashboardPage() {
                       <th className="p-4">System Role</th>
                       <th className="p-4">B2B Credit/Discount</th>
                       <th className="p-4">Custom Prices</th>
-                      {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                      {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                         <th className="p-4 text-right">Actions</th>
                       )}
                     </tr>
@@ -3889,7 +3951,7 @@ export default function DashboardPage() {
                             <span className="font-bold">{Object.keys(u.custom_pricing || {}).length} rules</span>
                           ) : '-'}
                         </td>
-                        {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                        {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                           <td className="p-4 text-right space-x-2">
                             {u.role === 'customer' && (
                               <button
@@ -4000,7 +4062,7 @@ export default function DashboardPage() {
 
           {/* TAB 9: TRASH BIN */}
           {/* TAB: WAREHOUSES */}
-          {activeTab === "warehouses" && ['admin', 'owner', 'manager'].includes(currentUser.role) && (
+          {activeTab === "warehouses" && ['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
             <div className="space-y-6">
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div>
@@ -4008,6 +4070,7 @@ export default function DashboardPage() {
                   <p className="text-xs text-slate-500 dark:text-gray-400">Create and manage physical warehouse locations. Stock is tracked per warehouse with full transfer support.</p>
                 </div>
                 <div className="flex gap-2">
+                  {['admin', 'owner', 'manager', 'warehouse_manager'].includes(currentUser.role) && (
                   <button
                     onClick={() => { setWarehouseForm({ name: '', location: '' }); setEditingWarehouseId(null); setShowWarehouseModal(true); }}
                     className="flex items-center gap-1.5 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-xs font-bold text-white cursor-pointer"
@@ -4015,6 +4078,8 @@ export default function DashboardPage() {
                     <Plus className="w-3.5 h-3.5" />
                     Add Warehouse
                   </button>
+                  )}
+                  {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                   <button
                     onClick={() => { setTransferForm({ productId: products[0]?.id || '', fromWarehouseId: warehouses[0]?.id || '', toWarehouseId: warehouses[1]?.id || '', qty: 1 }); setShowTransferModal(true); }}
                     disabled={warehouses.length < 2}
@@ -4023,6 +4088,7 @@ export default function DashboardPage() {
                     <RefreshCcw className="w-3.5 h-3.5" />
                     Transfer Stock
                   </button>
+                  )}
                 </div>
               </div>
 
@@ -4137,12 +4203,22 @@ export default function DashboardPage() {
               const cancelEntry = order.status_history?.find((h: any) => h.status === 'failed');
               const cancelledAt = cancelEntry?.updated_at || order.created_at;
               const reason = cancelEntry?.notes || 'No reason given';
+              const alreadyRestored = order.status_history?.some((h: any) => h.updated_by_name?.startsWith('STOCK_RESTORED:'));
+
+              // Only include items from orders that actually had stock deducted.
+              // Stock is deducted at 'approved' — if the order was cancelled while still
+              // 'created' (e.g. out-of-stock cancellation before approval), nothing was
+              // ever taken from stock so there's nothing to return.
+              const wasEverApproved = order.status_history?.some((h: any) =>
+                ['approved', 'packing', 'assigned', 'out_for_delivery'].includes(h.status)
+              );
+              if (!wasEverApproved) continue;
+
               for (const item of order.items) {
                 if (!productMap[item.product_id]) {
                   const prod = products.find(p => p.id === item.product_id);
                   productMap[item.product_id] = { productId: item.product_id, productName: item.name, totalQty: 0, unit: prod?.unit || 'Pcs', orders: [] };
                 }
-                const alreadyRestored = order.status_history?.some((h: any) => h.updated_by_name?.startsWith('STOCK_RESTORED:'));
                 productMap[item.product_id].totalQty += item.qty;
                 productMap[item.product_id].orders.push({ orderId: order.id, customerName: (order as any).customer_name || 'Unknown', qty: item.qty, cancelledAt, reason, alreadyRestored });
               }
@@ -4158,23 +4234,60 @@ export default function DashboardPage() {
                 await reloadOrdersAndStock(); // sync UI
                 return;
               }
-              // Check if this order was ever dispatched out for delivery
+
+              // CRITICAL: Only show items with reservations in the warehouse modal.
+              // For partially-approved orders, some items were never deducted and must not be
+              // included — iterating over order.items would add phantom stock for those items.
+              //
+              // Reservation status depends on how far the order got:
+              //   - cancelled before out_for_delivery → reservations are still 'active'
+              //   - cancelled from out_for_delivery → reservations were marked 'completed' at dispatch
               const wasOutForDelivery = liveOrder.status_history?.some((h: any) => h.status === 'out_for_delivery');
+              const allReservations = await db.getReservations();
+              const relevantReservations = allReservations.filter(r =>
+                r.order_id === liveOrder.id &&
+                (wasOutForDelivery ? r.status === 'completed' : r.status === 'active')
+              );
+
+              if (relevantReservations.length === 0) {
+                // Nothing was ever deducted for this order (cancelled before any approval).
+                // Mark as restored immediately so the UI removes the "Return to Stock" button.
+                const restoredEntry = { status: 'failed' as const, updated_at: new Date().toISOString(), updated_by_name: `STOCK_RESTORED:${currentUser!.name}` };
+                const newHistory = [...liveOrder.status_history, restoredEntry];
+                setOrders(prev => prev.map(o => o.id === liveOrder.id ? { ...o, status_history: newHistory } : o));
+                if (supabase) {
+                  await supabase.from('orders').update({ status_history: newHistory }).eq('id', liveOrder.id);
+                } else {
+                  const allOrders = JSON.parse(localStorage.getItem('orders') || '[]');
+                  localStorage.setItem('orders', JSON.stringify(allOrders.map((o: any) => o.id === liveOrder.id ? { ...o, status_history: newHistory } : o)));
+                }
+                await reloadOrdersAndStock();
+                return;
+              }
+
+              // Build a synthetic order containing ONLY the reserved items so the modal
+              // only shows what will actually be restored.
+              const reservedItems = relevantReservations.map(res => {
+                const original = liveOrder.items.find((i: any) => i.product_id === res.product_id);
+                return { ...original, product_id: res.product_id, qty: res.qty, warehouse_id: res.warehouse_id };
+              });
+              const orderForModal = { ...liveOrder, items: reservedItems };
 
               if (wasOutForDelivery) {
                 // Order came back from delivery — ask for ONE warehouse for all items
                 const firstWhId = warehouses[0]?.id || '';
                 setReturnSingleWarehouseId(firstWhId);
-                setReturnWarehouseModal({ order: liveOrder, singleWarehouseMode: true });
+                setReturnWarehouseModal({ order: orderForModal, singleWarehouseMode: true });
               } else {
-                // Order never went out — per-item warehouse selection
-                const orderWhId = (liveOrder as any).warehouse_id || '';
+                // Order never went out — per-item warehouse selection.
+                // Pre-fill each item with its reservation's source warehouse so the user
+                // sees where stock came from (and can override if needed).
                 const defaults: Record<string, string> = {};
-                for (const item of liveOrder.items) {
-                  defaults[item.product_id] = (item as any).warehouse_id || orderWhId || warehouses[0]?.id || '';
+                for (const res of relevantReservations) {
+                  defaults[res.product_id] = res.warehouse_id || warehouses[0]?.id || '';
                 }
                 setReturnItemWarehouses(defaults);
-                setReturnWarehouseModal({ order: liveOrder, singleWarehouseMode: false });
+                setReturnWarehouseModal({ order: orderForModal, singleWarehouseMode: false });
               }
             };
 
@@ -4188,7 +4301,7 @@ export default function DashboardPage() {
                       Cancelled Order Returns
                     </h2>
                     <p className="text-[11px] text-slate-400 dark:text-gray-500 mt-0.5">
-                      {cancelledOrders.length} cancelled orders · {productRows.reduce((s, r) => s + r.totalQty, 0)} total units pending review
+                      {productRows.length > 0 ? `${Object.keys(productMap).length > 0 ? cancelledOrders.filter(o => o.status_history?.some((h: any) => ['approved','packing','assigned','out_for_delivery'].includes(h.status))).length : 0} orders with stock to return · ${productRows.reduce((s, r) => s + r.totalQty, 0)} total units` : `${cancelledOrders.length} cancelled orders · no stock to return`}
                     </p>
                   </div>
                   <div className="flex items-center gap-1 bg-slate-200 dark:bg-white/5 rounded-lg p-1">
@@ -4203,11 +4316,11 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                {cancelledOrders.length === 0 && (
+                {(cancelledOrders.length === 0 || productRows.length === 0) && (
                   <div className="text-center py-16 text-slate-400 dark:text-gray-500">
                     <PackageCheck className="w-12 h-12 mx-auto mb-3 opacity-30" />
-                    <p className="font-semibold">No cancelled orders</p>
-                    <p className="text-[11px] mt-1">All orders are active or delivered</p>
+                    <p className="font-semibold">{cancelledOrders.length === 0 ? 'No cancelled orders' : 'No stock to return'}</p>
+                    <p className="text-[11px] mt-1">{cancelledOrders.length === 0 ? 'All orders are active or delivered' : 'Cancelled orders had no stock deducted — nothing needs returning'}</p>
                   </div>
                 )}
 
@@ -4373,7 +4486,7 @@ export default function DashboardPage() {
                           </td>
                           <td className="p-4 text-slate-500 dark:text-gray-400">{new Date(item.deletedAt).toLocaleString()}</td>
                           <td className="p-4 text-right space-x-2">
-                            {['admin', 'owner', 'manager', 'staff'].includes(currentUser.role) && (
+                            {['admin', 'superowner', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser.role) && (
                               <button
                                 onClick={() => restoreTrashItem(item.id, item.type)}
                                 className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-bold text-[10px]"
@@ -4381,7 +4494,7 @@ export default function DashboardPage() {
                                 Restore
                               </button>
                             )}
-                            {currentUser.role === 'admin' && (
+                            {['admin', 'superowner'].includes(currentUser.role) && (
                               <button
                                 onClick={() => permanentDeleteTrashItem(item.id, item.type)}
                                 className="px-2.5 py-1 bg-red-100 dark:bg-red-950/40 border border-red-200 dark:border-red-500/20 text-red-600 dark:text-red-400 rounded font-bold text-[10px]"
@@ -4780,7 +4893,11 @@ export default function DashboardPage() {
                     <p className="text-slate-400 dark:text-gray-500 mt-0.5">SKU: {productForm.sku} &nbsp;·&nbsp; {productForm.category}</p>
                   </div>
                   <div>
-                    <label className="block text-slate-500 dark:text-gray-400 mb-1">Update Stock Quantity</label>
+                    <div className="flex items-center gap-2 mb-2 p-2 rounded-lg bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-xs">
+                      <span className="text-slate-500 dark:text-gray-400">Current stock:</span>
+                      <span className="font-bold text-slate-900 dark:text-white">{editingProductOriginalStock} units</span>
+                    </div>
+                    <label className="block text-slate-500 dark:text-gray-400 mb-1">Set New Target Quantity</label>
                     <input
                       type="number"
                       required
@@ -4789,7 +4906,15 @@ export default function DashboardPage() {
                       onChange={(e) => setProductForm({ ...productForm, stock_qty: parseInt(e.target.value) || 0 })}
                       className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
                     />
-                    <p className="text-[10px] text-slate-400 dark:text-gray-500 mt-1">Enter the new total stock quantity for this product.</p>
+                    {(() => {
+                      const diff = (productForm.stock_qty ?? 0) - editingProductOriginalStock;
+                      if (diff === 0) return <p className="text-[10px] text-slate-400 dark:text-gray-500 mt-1">No change — stock will stay at {editingProductOriginalStock}.</p>;
+                      return (
+                        <p className={`text-[10px] mt-1 font-semibold ${diff > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400'}`}>
+                          {diff > 0 ? `▲ +${diff} units will be added` : `▼ ${diff} units will be removed`}
+                        </p>
+                      );
+                    })()}
                   </div>
                 </>
               ) : (
@@ -5031,17 +5156,40 @@ export default function DashboardPage() {
 
                   {/* Stock qty — shown both when creating AND when editing (admin/owner/manager) */}
                   <div>
-                    <label className="block text-slate-500 dark:text-gray-400 mb-1">
-                      {isEditingProduct ? 'Stock Quantity' : 'Initial Stock Qty'}
-                    </label>
-                    <input
-                      type="number"
-                      value={productForm.stock_qty}
-                      onChange={(e) => setProductForm({ ...productForm, stock_qty: parseInt(e.target.value) || 0 })}
-                      className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
-                    />
-                    {isEditingProduct && (
-                      <p className="text-[10px] text-slate-400 dark:text-gray-500 mt-1">Changing this will log a manual stock adjustment.</p>
+                    {isEditingProduct ? (
+                      <>
+                        <div className="flex items-center gap-2 mb-2 p-2 rounded-lg bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/10 text-xs">
+                          <span className="text-slate-500 dark:text-gray-400">Current stock:</span>
+                          <span className="font-bold text-slate-900 dark:text-white">{editingProductOriginalStock} units</span>
+                        </div>
+                        <label className="block text-slate-500 dark:text-gray-400 mb-1">Set New Target Quantity</label>
+                        <input
+                          type="number"
+                          min="0"
+                          value={productForm.stock_qty}
+                          onChange={(e) => setProductForm({ ...productForm, stock_qty: parseInt(e.target.value) || 0 })}
+                          className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                        />
+                        {(() => {
+                          const diff = (productForm.stock_qty ?? 0) - editingProductOriginalStock;
+                          if (diff === 0) return <p className="text-[10px] text-slate-400 dark:text-gray-500 mt-1">No change — stock will stay at {editingProductOriginalStock}.</p>;
+                          return (
+                            <p className={`text-[10px] mt-1 font-semibold ${diff > 0 ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-500 dark:text-red-400'}`}>
+                              {diff > 0 ? `▲ +${diff} units will be added` : `▼ ${diff} units will be removed`} — logged as manual adjustment.
+                            </p>
+                          );
+                        })()}
+                      </>
+                    ) : (
+                      <>
+                        <label className="block text-slate-500 dark:text-gray-400 mb-1">Initial Stock Qty</label>
+                        <input
+                          type="number"
+                          value={productForm.stock_qty}
+                          onChange={(e) => setProductForm({ ...productForm, stock_qty: parseInt(e.target.value) || 0 })}
+                          className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                        />
+                      </>
                     )}
                   </div>
 
@@ -5139,6 +5287,7 @@ export default function DashboardPage() {
                   <option value="superowner">Super Owner</option>
                   <option value="owner">Owner</option>
                   <option value="manager">Manager</option>
+                  <option value="warehouse_manager">Warehouse Manager</option>
                   <option value="accountant">Accountant</option>
                   <option value="staff">Warehouse Staff</option>
                   <option value="delivery">Delivery Staff</option>
@@ -5166,6 +5315,20 @@ export default function DashboardPage() {
                       className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
                     />
                   </div>
+                  {!isEditingUser && (
+                    <div className="col-span-2">
+                      <label className="block text-slate-500 dark:text-gray-400 mb-1">Opening Balance (SAR)</label>
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={(userForm as any).opening_balance || 0}
+                        onChange={(e) => setUserForm({ ...userForm, opening_balance: parseFloat(e.target.value) || 0 } as any)}
+                        className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
+                      />
+                      <p className="text-[10px] text-slate-400 dark:text-gray-500 mt-1">Pre-existing balance owed before this account was created. Logged as an opening entry in the customer ledger.</p>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -5372,7 +5535,36 @@ export default function DashboardPage() {
                 The following items have insufficient stock and cannot be fully fulfilled. Please choose how you want to resolve this:
               </p>
 
-              {/* OUT OF STOCK ITEMS */}
+              {/* PARTIALLY AVAILABLE ITEMS — staff can adjust qty */}
+              {outOfStockDialogData.partialItems.length > 0 && (
+                <div className="space-y-1.5">
+                  <span className="text-[10px] font-bold text-amber-600 dark:text-amber-400 uppercase tracking-wider">Partially Available — Adjust Quantity</span>
+                  <div className="rounded-lg border border-amber-200 dark:border-amber-500/20 bg-amber-50/50 dark:bg-amber-950/10 p-2.5 space-y-2">
+                    {outOfStockDialogData.partialItems.map((item: any) => (
+                      <div key={item.product_id} className="flex items-center justify-between gap-2 text-[11px]">
+                        <div className="flex-1 min-w-0">
+                          <span className="font-bold text-slate-800 dark:text-gray-200 block truncate">{item.name}</span>
+                          <span className="text-amber-600 dark:text-amber-400 font-mono">Ordered: {item.qty} · Available: {item.availableQty}</span>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <span className="text-slate-500 dark:text-gray-400 text-[10px]">Approve:</span>
+                          <input
+                            type="number"
+                            min={0}
+                            max={item.availableQty}
+                            value={adjustedQtys[item.product_id] ?? item.availableQty}
+                            onChange={e => setAdjustedQtys(prev => ({ ...prev, [item.product_id]: Math.min(item.availableQty, Math.max(0, Number(e.target.value))) }))}
+                            className="w-14 px-1.5 py-1 rounded border border-amber-300 dark:border-amber-500/40 bg-white dark:bg-white/10 text-slate-900 dark:text-white text-center font-mono font-bold text-[11px] focus:outline-none focus:ring-1 focus:ring-amber-400"
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* FULLY OUT OF STOCK ITEMS */}
+              {outOfStockDialogData.outOfStockItems.length > 0 && (
               <div className="space-y-1.5">
                 <span className="text-[10px] font-bold text-red-600 dark:text-red-400 uppercase tracking-wider">Out of Stock Items</span>
                 <div className="max-h-28 overflow-y-auto rounded-lg border border-red-200 dark:border-red-500/20 bg-red-50/50 dark:bg-red-950/10 p-2.5 space-y-1.5">
@@ -5384,6 +5576,7 @@ export default function DashboardPage() {
                   ))}
                 </div>
               </div>
+              )}
 
               {/* AVAILABLE ITEMS */}
               {outOfStockDialogData.availableItems.length > 0 && (
@@ -5402,17 +5595,53 @@ export default function DashboardPage() {
             </div>
 
             <div className="bg-slate-100 dark:bg-white/5 border border-slate-200 dark:border-white/5 rounded-lg p-3 text-[11px] text-slate-600 dark:text-gray-400 space-y-1.5">
-              <p><strong>Option 1: Approve available items only</strong> - Removes out-of-stock items, recalculates totals, and approves available items.</p>
-              <p><strong>Option 2: Keep pending</strong> - Keeps the order in its current pending status.</p>
-              <p><strong>Option 3: Cancel order</strong> - Marks the order as failed/cancelled.</p>
+              {outOfStockDialogData.partialItems.length > 0 && <p><strong>Option 1: Adjust qty &amp; approve</strong> - Set the quantity to what's available for partial items, approve the order.</p>}
+              <p><strong>{outOfStockDialogData.partialItems.length > 0 ? 'Option 2' : 'Option 1'}: Approve available items only</strong> - Removes out-of-stock items, recalculates totals, and approves available items.</p>
+              <p><strong>{outOfStockDialogData.partialItems.length > 0 ? 'Option 3' : 'Option 2'}: Keep pending</strong> - Keeps the order in its current pending status.</p>
+              <p><strong>{outOfStockDialogData.partialItems.length > 0 ? 'Option 4' : 'Option 3'}: Cancel order</strong> - Marks the order as failed/cancelled.</p>
             </div>
 
             <div className="flex flex-col sm:flex-row justify-end gap-2 pt-3 border-t border-slate-200 dark:border-white/5 text-xs">
+              {/* ADJUST & APPROVE — shown only when partial items exist */}
+              {outOfStockDialogData.partialItems.length > 0 && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      // Build the full items list: available items (unchanged) + partial items at adjusted qty
+                      const allItemsForApproval = [
+                        ...outOfStockDialogData.availableItems,
+                        ...outOfStockDialogData.partialItems.map((item: any) => ({
+                          ...item,
+                          adjustedQty: adjustedQtys[item.product_id] ?? item.availableQty
+                        }))
+                      ];
+                      const removedItems = outOfStockDialogData.outOfStockItems;
+                      await (db as any).approveOrderWithAdjustedItems(
+                        outOfStockDialogData.orderId,
+                        allItemsForApproval,
+                        removedItems,
+                        currentUser
+                      );
+                      setShowOutOfStockDialog(false);
+                      setOutOfStockDialogData(null);
+                      setAdjustedQtys({});
+                      await reloadOrdersAndStock();
+                    } catch (err: any) {
+                      alert(err.message || "Failed to approve with adjusted quantities.");
+                    }
+                  }}
+                  className="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-lg transition"
+                >
+                  Adjust Qty &amp; Approve
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
                   setShowOutOfStockDialog(false);
                   setOutOfStockDialogData(null);
+                  setAdjustedQtys({});
                 }}
                 className="px-4 py-2 bg-slate-200 dark:bg-white/5 hover:bg-slate-300 dark:hover:bg-white/10 text-slate-800 dark:text-white rounded-lg transition"
               >
@@ -5902,7 +6131,11 @@ export default function DashboardPage() {
               {lastOrderId && (
                 <p className="text-xs font-mono text-blue-600 dark:text-blue-400 mb-2">{lastOrderId}</p>
               )}
-              <p className="text-xs text-slate-500 dark:text-gray-400">Your order has been submitted successfully and is now pending approval.</p>
+              <p className="text-xs text-slate-500 dark:text-gray-400">
+                {currentUser && ['admin', 'superowner', 'owner', 'manager', 'warehouse_manager'].includes(currentUser.role)
+                  ? 'Order placed and automatically approved. Stock has been reserved.'
+                  : 'Your order has been submitted successfully and is now pending approval.'}
+              </p>
             </div>
             <div className="w-full flex flex-col gap-2">
               <button
