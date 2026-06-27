@@ -2596,11 +2596,7 @@ export default function DashboardPage() {
                           <span className="text-[11px] font-bold uppercase tracking-wider">{col.label}</span>
                         </div>
                         <div className="flex items-center gap-1.5">
-                          {col.key === 'delivered' && colOrders.length > 0 && (
-                            <span className="text-[9px] font-semibold text-emerald-600 dark:text-emerald-400 hidden sm:inline">
-                              {formatSAR(colOrders.reduce((s, o) => s + o.total, 0))}
-                            </span>
-                          )}
+
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${cc.badge}`}>
                             {colOrders.length}
                           </span>
