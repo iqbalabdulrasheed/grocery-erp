@@ -727,9 +727,13 @@ export default function DashboardPage() {
     e.preventDefault();
     if (paymentForm.amount <= 0 || !paymentForm.customerId) return;
 
-    // Optimistic: update the customer balance in usersList immediately
+    // Capture values before clearing form state
     const customerId = paymentForm.customerId;
     const amount = paymentForm.amount;
+    const ref = paymentForm.ref;
+    const notes = paymentForm.notes;
+
+    // Optimistic: update the customer balance in usersList immediately
     setUsersList(prev => prev.map(u =>
       u.id === customerId ? { ...u, outstanding_balance: Math.max(0, (u.outstanding_balance || 0) - amount) } : u
     ));
@@ -737,7 +741,7 @@ export default function DashboardPage() {
     setPaymentForm({ amount: 0, ref: "", notes: "", customerId: "" });
 
     try {
-      await db.recordCustomerPayment(customerId, amount, paymentForm.ref, paymentForm.notes, currentUser!);
+      await db.recordCustomerPayment(customerId, amount, ref, notes, currentUser!);
     } catch (err: any) {
       alert(err.message);
       await reloadData(); // revert on error
@@ -1072,8 +1076,8 @@ export default function DashboardPage() {
 
     <div class="totals-box">
       <div class="totals-row"><span class="info-label">Subtotal (Ex VAT):</span><span class="info-value">${formatSAR(subtotalBeforeVat)}</span></div>
-      <div class="totals-row"><span class="info-label">VAT (15%):</span><span class="info-value">${formatSAR(vatTotal)}</span></div>
       ${order.discount > 0 ? `<div class="totals-row"><span class="info-label">Discount:</span><span class="info-value" style="color:#ef4444;">- ${formatSAR(order.discount)}</span></div>` : ''}
+      <div class="totals-row"><span class="info-label">VAT (15%):</span><span class="info-value">${formatSAR(vatTotal)}</span></div>
       <div class="totals-row grand-total"><span>Grand Total (Inc VAT) / المجموع النهائي:</span><span>${formatSAR(grandTotal)}</span></div>
     </div>
 
@@ -1287,37 +1291,59 @@ export default function DashboardPage() {
 
   const { from: filterFrom, to: filterTo, days: filterDays } = getDateBounds();
 
-  // Orders in the selected date range (by created_at date)
+  // Helper: get the date an order was delivered (from status_history), falling back to created_at
+  const getDeliveredDate = (o: Order): string => {
+    const entry = o.status_history?.find((h: any) => h.status === 'delivered');
+    return entry ? entry.updated_at.split('T')[0] : o.created_at.split('T')[0];
+  };
+
+  // Revenue/cost scoped to selected date range — recognised at delivery date, not order creation date
   const rangeOrders = orders.filter(o => {
-    const d = o.created_at.split('T')[0];
+    if (o.status !== 'delivered') return false;
+    const d = getDeliveredDate(o);
     return d >= filterFrom && d <= filterTo;
   });
 
   const getOverviewData = () => {
-    // For daily: show last 24 hrs by hour label; for monthly/custom: show per-day
-    let chartDays = filterDays;
-    // Cap chart to 31 points for readability
-    if (chartDays.length > 31) {
-      const step = Math.ceil(chartDays.length / 31);
-      chartDays = chartDays.filter((_, i) => i % step === 0);
+    let chartData: { date: string; Sales: number; Profit: number }[] = [];
+
+    if (dateRange === 'daily') {
+      // Build 24 hourly buckets for today — buckets keyed by delivery hour
+      const todayStr = new Date().toISOString().split('T')[0];
+      const todayOrders = orders.filter(o => o.status === 'delivered' && getDeliveredDate(o) === todayStr);
+      chartData = Array.from({ length: 24 }, (_, hour) => {
+        const label = hour === 0 ? '12am' : hour < 12 ? `${hour}am` : hour === 12 ? '12pm' : `${hour - 12}pm`;
+        const hourOrders = todayOrders.filter(o => {
+          const entry = o.status_history?.find((h: any) => h.status === 'delivered');
+          return entry ? new Date(entry.updated_at).getHours() === hour : false;
+        });
+        const totalSales = hourOrders.reduce((sum, o) => sum + o.total, 0);
+        const totalCost = hourOrders.reduce((sum, o) =>
+          sum + o.items.reduce((cs, item) => {
+            const prod = products.find(p => p.id === item.product_id);
+            return cs + (prod ? prod.purchase_cost * item.qty : 0);
+          }, 0), 0);
+        return { date: label, Sales: totalSales, Profit: totalSales - totalCost };
+      });
+    } else {
+      // Monthly / custom — one bar per day keyed by delivery date, capped to 31 points
+      let chartDays = filterDays;
+      if (chartDays.length > 31) {
+        const step = Math.ceil(chartDays.length / 31);
+        chartDays = chartDays.filter((_, i) => i % step === 0);
+      }
+      chartData = chartDays.map(date => {
+        const dayOrders = orders.filter(o => o.status === 'delivered' && getDeliveredDate(o) === date);
+        const totalSales = dayOrders.reduce((sum, o) => sum + o.total, 0);
+        const totalCost = dayOrders.reduce((sum, o) =>
+          sum + o.items.reduce((costSum, item) => {
+            const prod = products.find(p => p.id === item.product_id);
+            return costSum + (prod ? prod.purchase_cost * item.qty : 0);
+          }, 0), 0);
+        const label = new Date(date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+        return { date: label, Sales: totalSales, Profit: totalSales - totalCost };
+      });
     }
-
-    const chartData = chartDays.map(date => {
-      const dayOrders = orders.filter(o => o.status === 'delivered' && o.created_at.startsWith(date));
-      const totalSales = dayOrders.reduce((sum, o) => sum + o.total, 0);
-      const totalCost = dayOrders.reduce((sum, o) => {
-        return sum + o.items.reduce((costSum, item) => {
-          const prod = products.find(p => p.id === item.product_id);
-          return costSum + (prod ? prod.purchase_cost * item.qty : 0);
-        }, 0);
-      }, 0);
-
-      const label = dateRange === 'daily'
-        ? new Date(date).toLocaleDateString('en-US', { weekday: 'short' })
-        : new Date(date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-
-      return { date: label, Sales: totalSales, Profit: totalSales - totalCost };
-    });
 
     const categoryTotals: Record<string, number> = {};
     products.forEach(p => {
@@ -1330,9 +1356,9 @@ export default function DashboardPage() {
 
   const { chartData, pieData } = getOverviewData();
 
-  // Accounting Summary stats — scoped to selected date range
-  const totalSalesVal = rangeOrders.filter(o => o.status === 'delivered').reduce((sum, o) => sum + o.total, 0);
-  const totalCostVal = rangeOrders.filter(o => o.status === 'delivered').reduce((sum, o) => {
+  // Accounting Summary stats — scoped to selected date range, recognised at delivery date
+  const totalSalesVal = rangeOrders.reduce((sum, o) => sum + o.total, 0);
+  const totalCostVal = rangeOrders.reduce((sum, o) => {
     return sum + o.items.reduce((costSum, item) => {
       const prod = products.find(p => p.id === item.product_id);
       return costSum + (prod ? prod.purchase_cost * item.qty : 0);
@@ -1956,7 +1982,7 @@ export default function DashboardPage() {
                             </span>
                             {['admin', 'owner', 'manager', 'warehouse_manager', 'staff'].includes(currentUser?.role) && (
                               <p className="text-[9px] text-blue-500 dark:text-blue-400 mt-1 underline cursor-pointer" onClick={() => {
-                                setStockForm({ ...stockForm, productId: p.id, qty: p.min_stock * 2, type: 'purchase' });
+                                setStockForm({ ...stockForm, productId: p.id, qty: p.min_stock * 3, type: 'purchase' });
                                 setShowStockModal(true);
                               }}>
                                 Auto Reorder Suggestion: +{p.min_stock * 3}
@@ -3337,6 +3363,7 @@ export default function DashboardPage() {
                         onChange={(e) => setSelectedCustomerId(e.target.value)}
                         className="glass-input block w-full px-3 py-2 rounded-lg text-xs"
                       >
+                        <option value="">— Select Customer —</option>
                         {usersList.filter(u => u.role === 'customer').map(c => (
                           <option key={c.id} value={c.id}>{c.name}</option>
                         ))}
@@ -3350,11 +3377,23 @@ export default function DashboardPage() {
                     ) : (
                       cart.map(item => {
                         const prod = products.find(p => p.id === item.product_id)!;
+                        const selectedCustomer = currentUser.role === 'customer'
+                          ? currentUser
+                          : usersList.find(u => u.id === selectedCustomerId);
+                        const effectivePrice = selectedCustomer
+                          ? db.calculateCustomerPrice(selectedCustomer as any, prod)
+                          : prod.selling_price;
+                        const isDiscounted = effectivePrice < prod.selling_price;
                         return (
                           <div key={item.product_id} className="flex justify-between items-center gap-2 text-xs">
                             <div className="min-w-0 flex-1">
                               <h4 className="font-bold text-slate-900 dark:text-white truncate">{prod.name}</h4>
-                              <span className="text-[10px] text-blue-500 dark:text-blue-400">{formatSAR(prod.selling_price)}</span>
+                              <div className="flex items-center gap-1.5">
+                                {isDiscounted && (
+                                  <span className="text-[10px] line-through text-slate-400">{formatSAR(prod.selling_price)}</span>
+                                )}
+                                <span className={`text-[10px] font-bold ${isDiscounted ? 'text-emerald-500 dark:text-emerald-400' : 'text-blue-500 dark:text-blue-400'}`}>{formatSAR(effectivePrice)}</span>
+                              </div>
                             </div>
                             <div className="flex items-center gap-1.5 shrink-0">
                               <input
@@ -3453,9 +3492,14 @@ export default function DashboardPage() {
                               )}
                               {manualAmtCapped > 0 && (
                                 <div className="flex justify-between text-amber-600 dark:text-amber-400">
-                                  <span>Fixed deduction:</span>
+                                  <span>Fixed deduction{manualDiscountAmt > manualAmtCapped ? ` (capped from ${formatSAR(manualDiscountAmt)})` : ''}:</span>
                                   <span className="font-semibold">- {formatSAR(manualAmtCapped)}</span>
                                 </div>
+                              )}
+                              {manualDiscountAmt > 0 && manualAmtCapped === 0 && (
+                                <p className="text-[10px] text-red-500 dark:text-red-400 font-semibold">
+                                  ⚠ Fixed amount fully absorbed by % discount — no additional deduction applied.
+                                </p>
                               )}
                             </div>
                           )}
@@ -5853,6 +5897,18 @@ export default function DashboardPage() {
                     onChange={(e) => setPaymentForm({ ...paymentForm, amount: parseFloat(e.target.value) || 0 })}
                     className="glass-input block w-full px-3 py-2 rounded-lg text-slate-900 dark:text-white"
                   />
+                  {(() => {
+                    const selectedC = usersList.find(u => u.id === paymentForm.customerId);
+                    const owed = selectedC?.outstanding_balance || 0;
+                    if (paymentForm.amount > 0 && owed > 0 && paymentForm.amount > owed) {
+                      return (
+                        <p className="mt-1 text-[10px] text-amber-600 dark:text-amber-400 font-semibold">
+                          ⚠ Exceeds balance owed ({formatSAR(owed)}) — overpayment of {formatSAR(paymentForm.amount - owed)} will create a credit on account.
+                        </p>
+                      );
+                    }
+                    return null;
+                  })()}
                 </div>
                 <div>
                   <label className="block text-slate-500 dark:text-gray-400 mb-1">Receipt/Payment Ref</label>
